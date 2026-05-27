@@ -48,6 +48,7 @@ class AgentLoop:
         system_prompt: str | None = None,
         max_iterations: int = 8,
         tool_concurrency: int = 8,
+        stop_after_tools: set[str] | frozenset[str] | None = None,
         container_cleanup_delay_minutes: float = 5,
         lease_provider: SessionLeaseProvider | None = None,
         memory: MemoryManager | None = None,
@@ -61,6 +62,7 @@ class AgentLoop:
         if tool_concurrency < 1:
             raise ValueError("tool_concurrency must be at least 1")
         self.tool_concurrency = tool_concurrency
+        self.stop_after_tools = frozenset(stop_after_tools or ())
         self.container_cleanup_delay_minutes = container_cleanup_delay_minutes
         self.lease_provider = lease_provider or StorageSessionLeaseProvider(storage)
         self.events = EventSink(storage)
@@ -269,6 +271,44 @@ class AgentLoop:
             await self.storage.save_turn(tool_turn)
             context_boundary_turn_id = tool_turn.id
             messages.append(ModelMessage(role="tool", content=raw_tool_result_content))
+            terminal_tool = next(
+                (
+                    result.name
+                    for result in tool_results
+                    if result.status == "ok" and result.name in self.stop_after_tools
+                ),
+                None,
+            )
+            if terminal_tool is not None:
+                final = f"Stopped after successful tool: {terminal_tool}"
+                await self.storage.save_turn(
+                    turn_from_message(
+                        session_id=session_id,
+                        role="assistant",
+                        content=redact(final),
+                        metadata={"iteration": iteration, "stopped_after_tool": terminal_tool},
+                    )
+                )
+                await self.events.emit(
+                    "agent.run.finished",
+                    session_id=session_id,
+                    iterations=iteration,
+                    stopped_after_tool=terminal_tool,
+                )
+                await self._capture_memory(
+                    session_id=session_id,
+                    user_message=user_message,
+                    assistant_message=final,
+                    tool_results=all_tool_results,
+                    source_turn_id=user_turn.id,
+                )
+                return AgentRunResult(
+                    session_id=session_id,
+                    final=final,
+                    tool_results=all_tool_results,
+                    iterations=iteration,
+                    memory_ids=memory_ids,
+                )
 
         final = "Agent stopped before producing a final answer."
         await self.storage.save_turn(

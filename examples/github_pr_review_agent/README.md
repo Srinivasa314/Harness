@@ -7,7 +7,7 @@ main runtime features together:
 - MiniLM or OpenAI embeddings and scoped memory.
 - Capability-gated tools.
 - Environment-backed GitHub credential resolution.
-- Docker container tool execution.
+- Agent-directed Docker bash execution.
 - Context compaction.
 - SQLite observability records and dashboard inspection.
 
@@ -38,8 +38,9 @@ uv run python examples/github_pr_review_agent/agent.py
 
 `HARNESS_REPO_PATH` should point to a local checkout for the repository being
 reviewed. If it is omitted, the example analyzes the current working directory.
-The Dockerized project-check tool mounts that checkout read-only at `/repo` so
-it can inspect files without being able to modify the host directory.
+The `repo.bash` tool mounts that checkout read-only at `/repo` so the agent can
+explore files and configuration with shell commands without being able to modify
+the host directory. The container has no network access.
 
 The example requires Docker for the sandboxed project-check tool.
 It keeps its SQLite database by default so memories can carry across runs. Set
@@ -52,7 +53,8 @@ export HARNESS_GITHUB_COMMENT=1
 ```
 
 When enabled, commenting is done by the agent through the `github.pr_comment`
-tool after it has run `github.pr_context` and `repo.project_check`.
+tool after it has run `github.pr_context` and explored the checkout with
+`repo.bash`.
 GitHub shows the comment author based on the token used. A personal token posts
 as that user; use a GitHub App or machine-user token if the comment should have
 a dedicated bot identity. The comment body is marked as coming from the Harness

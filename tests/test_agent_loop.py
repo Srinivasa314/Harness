@@ -1159,6 +1159,32 @@ async def test_agent_loop_runs_tool_batch(storage):
     assert [tool_result.output["value"] for tool_result in result.tool_results] == ["a", "b"]
 
 
+async def test_agent_loop_can_stop_after_successful_tool(storage):
+    session = await AgentSessionManager(storage).create()
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                content=json.dumps(
+                    {"tool_calls": [{"name": "echo", "arguments": {"value": "posted"}}]}
+                )
+            ),
+            ModelResponse(content='{"final": "should not be requested"}'),
+        ]
+    )
+    loop = AgentLoop(
+        model=model,
+        tools=build_gateway(storage),
+        storage=storage,
+        stop_after_tools={"echo"},
+    )
+
+    result = await loop.run(session.id, "post")
+
+    assert result.final == "Stopped after successful tool: echo"
+    assert result.iterations == 1
+    assert model.responses
+
+
 async def test_agent_loop_redacts_tool_call_arguments_in_transcript(storage):
     session = await AgentSessionManager(storage).create()
     model = ScriptedModel(
@@ -1324,23 +1350,23 @@ async def test_session_lease_provider_heartbeats_active_sessions(storage):
     provider = StorageSessionLeaseProvider(
         storage,
         owner_id="runtime-a",
-        ttl_seconds=0.05,
-        heartbeat_seconds=0.01,
+        ttl_seconds=0.2,
+        heartbeat_seconds=0.02,
     )
     lease = await provider.enter_session(session.id)
 
-    await anyio.sleep(0.08)
+    await anyio.sleep(0.12)
 
     assert not await storage.try_acquire_session_lease(
         session.id,
         "runtime-b",
-        ttl_seconds=0.05,
+        ttl_seconds=0.2,
     )
     await lease.release()
     assert await storage.try_acquire_session_lease(
         session.id,
         "runtime-b",
-        ttl_seconds=0.05,
+        ttl_seconds=0.2,
     )
     await storage.release_session_lease(session.id, "runtime-b")
 

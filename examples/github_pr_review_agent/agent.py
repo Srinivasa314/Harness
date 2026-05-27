@@ -39,183 +39,40 @@ MAX_GITHUB_PAGES = 5
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
 
-PROJECT_CHECKER = r"""
-from collections import Counter
+BASH_RUNNER = r"""
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
-MAX_REPO_FILES = 2000
-MAX_CONFIG_CHARS = 20000
-CONFIG_FILENAMES = {
-    ".github/dependabot.yml",
-    ".github/dependabot.yaml",
-    ".pre-commit-config.yaml",
-    ".semgrep.yml",
-    "Cargo.toml",
-    "Dockerfile",
-    "Gemfile",
-    "Makefile",
-    "build.gradle",
-    "build.gradle.kts",
-    "compose.yaml",
-    "docker-compose.yml",
-    "go.mod",
-    "package.json",
-    "pnpm-lock.yaml",
-    "pom.xml",
-    "pyproject.toml",
-    "requirements-dev.txt",
-    "requirements.txt",
-    "tsconfig.json",
-    "tox.ini",
-    "uv.lock",
-    "yarn.lock",
-}
-SKIP_DIRS = {
-    ".git",
-    ".hg",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "dist",
-    "node_modules",
-    "target",
-}
-
-root = Path.cwd()
-files = []
-config_files = {}
-for current, dirs, filenames in os.walk(root):
-    dirs[:] = [dirname for dirname in dirs if dirname not in SKIP_DIRS]
-    for filename in filenames:
-        path = Path(current) / filename
-        relative = path.relative_to(root).as_posix()
-        files.append(relative)
-        if (
-            relative in CONFIG_FILENAMES
-            or filename in CONFIG_FILENAMES
-            or relative.startswith(".github/workflows/")
-        ):
-            try:
-                config_files[relative] = path.read_text(errors="replace")[:MAX_CONFIG_CHARS]
-            except OSError:
-                pass
-        if len(files) >= MAX_REPO_FILES:
-            break
-    if len(files) >= MAX_REPO_FILES:
-        break
-
-lower_files = [path.lower() for path in files]
-suffixes = Counter(path.rsplit(".", 1)[-1] for path in lower_files if "." in path)
-
-language_markers = {
-    "python": [".py", "pyproject.toml", "requirements.txt", "tox.ini"],
-    "javascript": [".js", "package.json"],
-    "typescript": [".ts", ".tsx", "tsconfig.json"],
-    "go": [".go", "go.mod"],
-    "rust": [".rs", "Cargo.toml"],
-    "java": [".java", "pom.xml", "build.gradle", "build.gradle.kts"],
-    "ruby": [".rb", "Gemfile"],
-    "shell": [".sh"],
-    "docker": ["Dockerfile", "docker-compose.yml", "compose.yaml"],
-}
-
-def has_marker(markers):
-    return any(
-        path.endswith(marker.lower()) or path == marker.lower()
-        for marker in markers
-        for path in lower_files
-    ) or any(marker in config_files for marker in markers)
-
-languages = sorted(name for name, markers in language_markers.items() if has_marker(markers))
-package_managers = []
-if "package.json" in config_files:
-    package_managers.append("npm-compatible")
-if "pnpm-lock.yaml" in lower_files:
-    package_managers.append("pnpm")
-if "yarn.lock" in lower_files:
-    package_managers.append("yarn")
-if "pyproject.toml" in config_files or "requirements.txt" in config_files:
-    package_managers.append("python")
-if "uv.lock" in config_files:
-    package_managers.append("uv")
-if "go.mod" in config_files:
-    package_managers.append("go modules")
-if "Cargo.toml" in config_files:
-    package_managers.append("cargo")
-if "pom.xml" in config_files:
-    package_managers.append("maven")
-if "build.gradle" in config_files or "build.gradle.kts" in config_files:
-    package_managers.append("gradle")
-if "Gemfile" in config_files:
-    package_managers.append("bundler")
-
-config_text = "\n".join(str(value).lower() for value in config_files.values())
-test_indicators = sorted({
-    indicator
-    for indicator in [
-        "pytest",
-        "unittest",
-        "jest",
-        "vitest",
-        "mocha",
-        "go test",
-        "cargo test",
-        "junit",
-        "rspec",
-    ]
-    if indicator in config_text
-})
-has_test_file = any(
-    "/test" in path or path.startswith("test") or ".test." in path or "_test." in path
-    for path in lower_files
-)
-if has_test_file:
-    test_indicators.append("test files present")
-
-ci_present = any(path.startswith(".github/workflows/") for path in lower_files) or any(
-    path in {".gitlab-ci.yml", "circle.yml", ".circleci/config.yml"} for path in lower_files
-)
-container_suffixes = ("dockerfile", "docker-compose.yml", "compose.yaml")
-container_files = sorted(path for path in files if path.lower().endswith(container_suffixes))
-security_indicators = sorted({
-    indicator
-    for indicator in [
-        "dependabot",
-        "codeql",
-        "semgrep",
-        "trivy",
-        "bandit",
-        "npm audit",
-        "cargo audit",
-    ]
-    if indicator in config_text or any(indicator in path for path in lower_files)
-})
-
-notes = []
-if not test_indicators:
-    notes.append("No obvious test configuration or test files were detected in the local snapshot.")
-if not ci_present:
-    notes.append("No common CI workflow file was detected in the local snapshot.")
-if not security_indicators:
-    notes.append("No common dependency or static-analysis security configuration was detected.")
-
+payload = json.load(sys.stdin)
+arguments = payload.get("arguments", {})
+command = str(arguments["command"])
+workdir = Path(os.environ.get("HARNESS_REPO_MOUNT", "/repo"))
+if not workdir.exists():
+    workdir = Path.cwd()
+try:
+    completed = subprocess.run(
+        ["/bin/sh", "-lc", command],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+except subprocess.TimeoutExpired as exc:
+    print(json.dumps({
+        "command": command,
+        "returncode": 124,
+        "stdout": (exc.stdout or "")[-20000:],
+        "stderr": ((exc.stderr or "") + "\nCommand timed out after 25 seconds.")[-12000:],
+    }))
+    raise SystemExit(0)
 print(json.dumps({
-    "root_name": root.name,
-    "file_count_sampled": len(files),
-    "file_sample_truncated": len(files) >= MAX_REPO_FILES,
-    "top_extensions": suffixes.most_common(8),
-    "languages": languages,
-    "package_managers": sorted(set(package_managers)),
-    "test_indicators": sorted(set(test_indicators)),
-    "ci_present": ci_present,
-    "container_files": container_files[:20],
-    "security_indicators": security_indicators,
-    "notes": notes,
+    "command": command,
+    "returncode": completed.returncode,
+    "stdout": completed.stdout[-20000:],
+    "stderr": completed.stderr[-12000:],
 }))
 """
 
@@ -454,45 +311,38 @@ def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
         )
     registry.register(
         ToolDefinition(
-            name="repo.project_check",
-            description="Analyze a local repository snapshot inside Docker.",
+            name="repo.bash",
+            description=(
+                "Run a read-only POSIX shell command in the local checkout mounted at /repo. "
+                "Use this to inspect files, configuration, tests, and code quality signals. "
+                "Available commands include sh, find, grep, sed, head, cat, and python; "
+                "do not assume git, rg, package managers, or network tools are installed."
+            ),
             execution_mode=ExecutionMode.CONTAINER,
             container_schema="python-analysis",
-            container_command=["python", "-c", PROJECT_CHECKER],
+            container_command=["python", "-c", BASH_RUNNER],
             required_capabilities=["repo:sandbox"],
             timeout_seconds=30,
+            max_output_bytes=200_000,
             input_schema={
                 "type": "object",
-                "properties": {},
+                "required": ["command"],
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run with /repo as the working directory.",
+                    },
+                },
                 "additionalProperties": False,
             },
             output_schema={
                 "type": "object",
-                "required": [
-                    "root_name",
-                    "file_count_sampled",
-                    "file_sample_truncated",
-                    "top_extensions",
-                    "languages",
-                    "package_managers",
-                    "test_indicators",
-                    "ci_present",
-                    "container_files",
-                    "security_indicators",
-                    "notes",
-                ],
+                "required": ["command", "returncode", "stdout", "stderr"],
                 "properties": {
-                    "root_name": {"type": "string"},
-                    "file_count_sampled": {"type": "integer"},
-                    "file_sample_truncated": {"type": "boolean"},
-                    "top_extensions": {"type": "array"},
-                    "languages": {"type": "array", "items": {"type": "string"}},
-                    "package_managers": {"type": "array", "items": {"type": "string"}},
-                    "test_indicators": {"type": "array", "items": {"type": "string"}},
-                    "ci_present": {"type": "boolean"},
-                    "container_files": {"type": "array", "items": {"type": "string"}},
-                    "security_indicators": {"type": "array", "items": {"type": "string"}},
-                    "notes": {"type": "array", "items": {"type": "string"}},
+                    "command": {"type": "string"},
+                    "returncode": {"type": "integer"},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
                 },
                 "additionalProperties": False,
             },
@@ -518,7 +368,7 @@ async def main() -> None:
         storage_backend="sqlite",
         sqlite_path=DEMO_DB,
         model_provider=os.environ.get("HARNESS_MODEL_PROVIDER", "openai"),
-        openai_model=os.environ.get("HARNESS_OPENAI_MODEL", "gpt-4.1-mini"),
+        openai_model=os.environ.get("HARNESS_OPENAI_MODEL", "gpt-5.2"),
         embedding_provider=os.environ.get("HARNESS_EMBEDDING_PROVIDER", "minilm"),
         memory_enabled=True,
         memory_namespace="github-pr-review-demo",
@@ -592,6 +442,8 @@ async def main() -> None:
         await storage.create_session(session)
 
         loop = runtime.agent_loop(
+            max_iterations=12,
+            stop_after_tools={"github.pr_comment"} if comment_enabled else None,
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
@@ -720,9 +572,30 @@ def _review_prompt(
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
         f"Local repository root: {repo_path}\n\n"
-        "Required first tool batch: call github.pr_context with the repo and PR number "
-        "and repo.project_check with empty arguments {}. The repo.project_check tool "
-        "has read-only access to the local checkout at /repo inside Docker.\n\n"
+        "Strict workflow: iteration 1 must call github.pr_context with the repo and PR "
+        "number. Iteration 2 must call repo.bash with a batch of two to four focused "
+        "commands of your choice. Iteration 3 must call github.pr_comment if commenting "
+        "is enabled, otherwise return the final review. Do not call github.pr_context "
+        "after iteration 1. The repo.bash tool runs inside Docker with no network and "
+        "read-only access to the local checkout at /repo. "
+        "A repo.bash tool call must be shaped exactly like "
+        "{\"tool_calls\":[{\"name\":\"repo.bash\",\"arguments\":{\"command\":"
+        "\"find . -maxdepth 2 \\( -path './.git' -o -path './.venv' -o "
+        "-path './data' -o -name '.env*' -o -name '*cache*' \\) -prune -o "
+        "-type f -print | sort | head -80\"}}]}. "
+        "Run enough focused commands to inspect the PR surface, project configuration, "
+        "tests, CI, risky files, and code quality signals before writing the review. "
+        "Prefer cheap read-only commands such as find, sed, grep, python one-liners, "
+        "and test/config discovery. Do not inspect .env*, .git, .venv, data, dist, local "
+        "caches, credential files, or secret-looking files. Do not use git, rg, package "
+        "managers, network access, or commands that write to the repository. If a command "
+        "is unavailable or fails, adapt once with simpler POSIX tools inside the same "
+        "exploration batch if possible. After the repo.bash batch, draft the review from "
+        "the available evidence and proceed to the comment/final step. If commenting is "
+        "enabled, you must call github.pr_comment exactly once before the final answer, "
+        "shaped exactly like "
+        "{\"tool_calls\":[{\"name\":\"github.pr_comment\",\"arguments\":"
+        "{\"repo\":\"owner/name\",\"pr_number\":1,\"body\":\"review text\"}}]}.\n\n"
         f"{comment_instruction}"
     )
 

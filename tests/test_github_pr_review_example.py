@@ -12,11 +12,20 @@ import httpx
 import pytest
 
 
-def test_github_pr_example_project_checker_detects_generic_repo(tmp_path: Path) -> None:
+def test_github_pr_example_bash_runner_explores_generic_repo(tmp_path: Path) -> None:
     module = _load_example_module()
     repo = _generic_repo(tmp_path)
+    payload = {
+        "arguments": {
+            "command": (
+                "printf 'files='; find . -maxdepth 3 -type f | sort | sed 's#^./##'; "
+                "printf '\\nconfig='; sed -n '1,5p' go.mod"
+            )
+        }
+    }
     completed = subprocess.run(
-        [sys.executable, "-c", module.PROJECT_CHECKER],
+        [sys.executable, "-c", module.BASH_RUNNER],
+        input=json.dumps(payload),
         text=True,
         check=True,
         capture_output=True,
@@ -25,13 +34,30 @@ def test_github_pr_example_project_checker_detects_generic_repo(tmp_path: Path) 
 
     result = json.loads(completed.stdout)
 
-    assert result["root_name"] == "repo"
-    assert "go" in result["languages"]
-    assert "go modules" in result["package_managers"]
-    assert "go test" in result["test_indicators"]
-    assert "test files present" in result["test_indicators"]
-    assert result["ci_present"] is True
-    assert result["container_files"] == ["Dockerfile"]
+    assert result["returncode"] == 0
+    assert "go.mod" in result["stdout"]
+    assert "main_test.go" in result["stdout"]
+    assert "module example.com/service" in result["stdout"]
+
+
+def test_github_pr_example_bash_runner_reports_nonzero_exit(tmp_path: Path) -> None:
+    module = _load_example_module()
+    repo = _generic_repo(tmp_path)
+    payload = {"arguments": {"command": "sed -n '1p' missing-file"}}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", module.BASH_RUNNER],
+        input=json.dumps(payload),
+        text=True,
+        check=True,
+        capture_output=True,
+        cwd=repo,
+    )
+
+    result = json.loads(completed.stdout)
+
+    assert result["returncode"] != 0
+    assert "missing-file" in result["stderr"]
 
 
 def test_github_pr_example_comment_tool_is_optional() -> None:
@@ -46,6 +72,7 @@ def test_github_pr_example_comment_tool_is_optional() -> None:
 
     assert "github.pr_comment" not in without_comment_names
     assert "github.pr_comment" in with_comment_names
+    assert "repo.bash" in with_comment_names
 
 
 @pytest.mark.anyio
