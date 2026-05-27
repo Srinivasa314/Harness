@@ -34,28 +34,23 @@ def test_github_pr_example_repo_snapshot_is_generic(tmp_path: Path) -> None:
 
 def test_github_pr_example_project_checker_detects_generic_repo() -> None:
     module = _load_example_module()
-    payload = {
-        "arguments": {
-            "repo_snapshot": {
-                "root_name": "service",
-                "files": [
-                    ".github/workflows/test.yml",
-                    "Dockerfile",
-                    "go.mod",
-                    "main.go",
-                    "main_test.go",
-                ],
-                "config_files": {
-                    "go.mod": "module example.com/service\n",
-                    ".github/workflows/test.yml": "name: test\nrun: go test ./...\n",
-                },
-            }
-        }
+    snapshot = {
+        "root_name": "service",
+        "files": [
+            ".github/workflows/test.yml",
+            "Dockerfile",
+            "go.mod",
+            "main.go",
+            "main_test.go",
+        ],
+        "config_files": {
+            "go.mod": "module example.com/service\n",
+            ".github/workflows/test.yml": "name: test\nrun: go test ./...\n",
+        },
     }
 
     completed = subprocess.run(
-        [sys.executable, "-c", module.PROJECT_CHECKER],
-        input=json.dumps(payload),
+        [sys.executable, "-c", module.project_checker_script(snapshot)],
         text=True,
         check=True,
         capture_output=True,

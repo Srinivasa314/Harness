@@ -83,10 +83,8 @@ SKIP_DIRS = {
 PROJECT_CHECKER = r"""
 from collections import Counter
 import json
-import sys
 
-payload = json.load(sys.stdin)
-snapshot = payload["arguments"]["repo_snapshot"]
+snapshot = json.loads(SNAPSHOT_JSON)
 files = [str(path) for path in snapshot.get("files", [])]
 config_files = snapshot.get("config_files", {})
 lower_files = [path.lower() for path in files]
@@ -197,6 +195,11 @@ print(json.dumps({
     "notes": notes,
 }))
 """
+
+
+def project_checker_script(repo_snapshot: dict[str, Any]) -> str:
+    snapshot_json = json.dumps(repo_snapshot, sort_keys=True)
+    return f"SNAPSHOT_JSON = {snapshot_json!r}\n{PROJECT_CHECKER}"
 
 
 class PullRequestMemoryExtractor(MemoryExtractor):
@@ -344,7 +347,7 @@ async def _get_paginated_list(
     return items
 
 
-def build_registry() -> ToolRegistry:
+def build_registry(repo_snapshot: dict[str, Any]) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
@@ -397,27 +400,12 @@ def build_registry() -> ToolRegistry:
             description="Analyze a local repository snapshot inside Docker.",
             execution_mode=ExecutionMode.CONTAINER,
             container_schema="python-analysis",
-            container_command=["python", "-c", PROJECT_CHECKER],
+            container_command=["python", "-c", project_checker_script(repo_snapshot)],
             required_capabilities=["repo:sandbox"],
             timeout_seconds=30,
             input_schema={
                 "type": "object",
-                "required": ["repo_snapshot"],
-                "properties": {
-                    "repo_snapshot": {
-                        "type": "object",
-                        "required": ["root_name", "files", "config_files"],
-                        "properties": {
-                            "root_name": {"type": "string"},
-                            "files": {"type": "array", "items": {"type": "string"}},
-                            "config_files": {
-                                "type": "object",
-                                "additionalProperties": {"type": "string"},
-                            },
-                        },
-                        "additionalProperties": True,
-                    },
-                },
+                "properties": {},
                 "additionalProperties": False,
             },
             output_schema={
@@ -462,6 +450,7 @@ async def main() -> None:
     repo = os.environ.get("HARNESS_GITHUB_REPO", "")
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
+    repo_snapshot = _repo_snapshot(repo_path)
     settings = HarnessSettings(
         storage_backend="sqlite",
         sqlite_path=DEMO_DB,
@@ -487,7 +476,7 @@ async def main() -> None:
 
     storage = SQLiteStorage(DEMO_DB)
     await storage.migrate()
-    registry = build_registry()
+    registry = build_registry(repo_snapshot)
     schemas = ContainerSchemaRegistry(
         [
             ContainerSchema(
@@ -551,7 +540,12 @@ async def main() -> None:
         )
         result = await loop.run(
             session.id,
-            _review_prompt(repo=repo, pr_number=pr_number, repo_path=repo_path),
+            _review_prompt(
+                repo=repo,
+                pr_number=pr_number,
+                repo_path=repo_path,
+                repo_snapshot=repo_snapshot,
+            ),
         )
 
         turns = await storage.list_turns(session.id, limit=None)
@@ -637,9 +631,14 @@ def _comment_enabled() -> bool:
     }
 
 
-def _review_prompt(*, repo: str, pr_number: int, repo_path: Path) -> str:
-    repo_snapshot = _repo_snapshot(repo_path)
-    repo_snapshot_json = json.dumps(repo_snapshot, indent=2, sort_keys=True)
+def _review_prompt(
+    *,
+    repo: str,
+    pr_number: int,
+    repo_path: Path,
+    repo_snapshot: dict[str, Any],
+) -> str:
+    config_files = sorted(repo_snapshot.get("config_files", {}))
     return (
         "You are a GitHub PR review agent. Produce a concise code review with concrete "
         "findings, test gaps, and a release-readiness recommendation. Use the harness "
@@ -647,10 +646,12 @@ def _review_prompt(*, repo: str, pr_number: int, repo_path: Path) -> str:
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
         f"Local repository root: {repo_path}\n\n"
-        "Recommended first tool batch: call github.pr_context with the repo and PR number "
-        "and repo.project_check with the repo_snapshot below.\n\n"
-        "repo_snapshot:\n"
-        f"{repo_snapshot_json}"
+        "Required first tool batch: call github.pr_context with the repo and PR number "
+        "and repo.project_check with empty arguments {}. The repo.project_check tool "
+        "already has access to a bounded local repository snapshot prepared by the "
+        "harness.\n\n"
+        f"Snapshot summary: {len(repo_snapshot.get('files', []))} files sampled; "
+        f"config files: {', '.join(config_files) if config_files else 'none'}."
     )
 
 
