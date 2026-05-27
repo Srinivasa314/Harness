@@ -34,6 +34,10 @@ DEMO_DB = ROOT / "data" / "github_pr_review_agent.sqlite3"
 HF_CACHE = ROOT / "data" / "hf-cache"
 ST_CACHE = ROOT / "data" / "sentence-transformers"
 GITHUB_API = "https://api.github.com"
+GITHUB_PAGE_SIZE = 100
+MAX_GITHUB_PAGES = 5
+MAX_CHANGED_FILES_IN_CONTEXT = 80
+MAX_CHECK_RUNS_IN_CONTEXT = 50
 MAX_REPO_FILES = 500
 MAX_CONFIG_CHARS = 4_000
 CONFIG_FILENAMES = {
@@ -205,10 +209,17 @@ class PullRequestMemoryExtractor(MemoryExtractor):
                 continue
             repo = pr_context.get("repo")
             changed_files = pr_context.get("changed_files")
+            changed_files_total = pr_context.get("changed_files_total")
             check_runs = pr_context.get("check_runs")
             if not isinstance(repo, str):
                 continue
-            changed_count = len(changed_files) if isinstance(changed_files, list) else 0
+            changed_count = (
+                changed_files_total
+                if isinstance(changed_files_total, int)
+                else len(changed_files)
+                if isinstance(changed_files, list)
+                else 0
+            )
             failed_checks = [
                 str(check.get("name"))
                 for check in check_runs or []
@@ -254,20 +265,20 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
             headers=headers,
         )
         pr_response.raise_for_status()
-        files_response = await client.get(
+        pr = pr_response.json()
+        files = await _get_paginated_list(
+            client,
             f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files",
             headers=headers,
-            params={"per_page": 100},
+            list_key=None,
         )
-        files_response.raise_for_status()
-        checks_response = await client.get(
-            f"{GITHUB_API}/repos/{repo}/commits/{pr_response.json()['head']['sha']}/check-runs",
+        checks = await _get_paginated_list(
+            client,
+            f"{GITHUB_API}/repos/{repo}/commits/{pr['head']['sha']}/check-runs",
             headers=headers,
-            params={"per_page": 50},
+            list_key="check_runs",
+            tolerate_statuses={403, 404},
         )
-    pr = pr_response.json()
-    files = files_response.json()
-    checks = checks_response.json() if checks_response.status_code == 200 else {"check_runs": []}
     return {
         "repo": repo,
         "number": pr_number,
@@ -278,6 +289,8 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
         "base": pr["base"]["ref"],
         "head": pr["head"]["ref"],
         "body_excerpt": (pr.get("body") or "")[:2_000],
+        "changed_files_total": len(files),
+        "changed_files_truncated": len(files) > MAX_CHANGED_FILES_IN_CONTEXT,
         "changed_files": [
             {
                 "filename": item["filename"],
@@ -286,17 +299,48 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
                 "deletions": item["deletions"],
                 "patch_excerpt": (item.get("patch") or "")[:1_500],
             }
-            for item in files[:40]
+            for item in files[:MAX_CHANGED_FILES_IN_CONTEXT]
         ],
+        "check_runs_total": len(checks),
+        "check_runs_truncated": len(checks) > MAX_CHECK_RUNS_IN_CONTEXT,
         "check_runs": [
             {
                 "name": item.get("name"),
                 "status": item.get("status"),
                 "conclusion": item.get("conclusion"),
             }
-            for item in checks.get("check_runs", [])[:20]
+            for item in checks[:MAX_CHECK_RUNS_IN_CONTEXT]
         ],
     }
+
+
+async def _get_paginated_list(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    list_key: str | None,
+    tolerate_statuses: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    tolerated = tolerate_statuses or set()
+    for page in range(1, MAX_GITHUB_PAGES + 1):
+        response = await client.get(
+            url,
+            headers=headers,
+            params={"per_page": GITHUB_PAGE_SIZE, "page": page},
+        )
+        if response.status_code in tolerated:
+            return items
+        response.raise_for_status()
+        payload = response.json()
+        raw_items = payload.get(list_key, []) if list_key else payload
+        if not isinstance(raw_items, list):
+            return items
+        items.extend(item for item in raw_items if isinstance(item, dict))
+        if len(raw_items) < GITHUB_PAGE_SIZE:
+            break
+    return items
 
 
 def build_registry() -> ToolRegistry:
@@ -334,7 +378,11 @@ def build_registry() -> ToolRegistry:
                     "title": {"type": "string"},
                     "state": {"type": "string"},
                     "url": {"type": "string"},
+                    "changed_files_total": {"type": "integer"},
+                    "changed_files_truncated": {"type": "boolean"},
                     "changed_files": {"type": "array"},
+                    "check_runs_total": {"type": "integer"},
+                    "check_runs_truncated": {"type": "boolean"},
                     "check_runs": {"type": "array"},
                 },
                 "additionalProperties": True,
