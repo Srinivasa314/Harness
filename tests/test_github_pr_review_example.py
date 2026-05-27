@@ -6,6 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 from types import ModuleType
+from typing import Any
 
 import httpx
 import pytest
@@ -140,6 +141,53 @@ async def test_github_pr_example_tolerates_unavailable_check_runs() -> None:
         )
 
     assert checks == []
+
+
+def test_github_pr_example_comment_body_is_agent_branded() -> None:
+    module = _load_example_module()
+
+    body = module._comment_body("Looks ready.")
+
+    assert body.startswith(module.AGENT_COMMENT_MARKER)
+    assert "Harness PR Review Agent" in body
+    assert "Looks ready." in body
+    assert "Posted by the Harness PR review agent" in body
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_posts_agent_comment(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = _load_example_module()
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        captured["payload"] = json.loads(request.content)
+        return httpx.Response(
+            201,
+            json={"html_url": "https://github.test/owner/repo/pull/7#issuecomment-1"},
+        )
+
+    monkeypatch.setattr(module, "GITHUB_API", "https://api.github.test")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: client)
+
+    try:
+        url = await module.post_pr_comment(
+            repo="owner/repo",
+            pr_number=7,
+            token="secret-token",
+            review="Release-ready.",
+        )
+    finally:
+        await client.aclose()
+
+    assert url == "https://github.test/owner/repo/pull/7#issuecomment-1"
+    assert captured["url"] == "https://api.github.test/repos/owner/repo/issues/7/comments"
+    assert captured["authorization"] == "Bearer secret-token"
+    assert isinstance(captured["payload"], dict)
+    assert "Harness PR Review Agent" in str(captured["payload"]["body"])
+    assert "Release-ready." in str(captured["payload"]["body"])
 
 
 def _load_example_module() -> ModuleType:

@@ -34,6 +34,7 @@ DEMO_DB = ROOT / "data" / "github_pr_review_agent.sqlite3"
 HF_CACHE = ROOT / "data" / "hf-cache"
 ST_CACHE = ROOT / "data" / "sentence-transformers"
 GITHUB_API = "https://api.github.com"
+AGENT_COMMENT_MARKER = "<!-- harness-pr-review-agent -->"
 GITHUB_PAGE_SIZE = 100
 MAX_GITHUB_PAGES = 5
 MAX_CHANGED_FILES_IN_CONTEXT = 80
@@ -557,6 +558,14 @@ async def main() -> None:
         tool_calls = await storage.list_tool_calls(session.id, limit=None)
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
+        comment_url = None
+        if _comment_enabled():
+            comment_url = await post_pr_comment(
+                repo=repo,
+                pr_number=pr_number,
+                token=os.environ["HARNESS_SECRET_GITHUB_TOKEN"],
+                review=result.final,
+            )
 
         print(
             json.dumps(
@@ -570,6 +579,7 @@ async def main() -> None:
                     "final": result.final,
                     "tool_statuses": {call.tool_name: call.status for call in tool_calls},
                     "memory_ids_injected": result.memory_ids,
+                    "comment_url": comment_url,
                     "counts": {
                         "turns": len(turns),
                         "tool_calls": len(tool_calls),
@@ -587,6 +597,42 @@ async def main() -> None:
         )
     finally:
         await runtime.close()
+
+
+async def post_pr_comment(*, repo: str, pr_number: int, token: str, review: str) -> str:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    body = _comment_body(review)
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
+            headers=headers,
+            json={"body": body},
+        )
+    response.raise_for_status()
+    payload = response.json()
+    url = payload.get("html_url")
+    return str(url) if isinstance(url, str) else ""
+
+
+def _comment_body(review: str) -> str:
+    return (
+        f"{AGENT_COMMENT_MARKER}\n"
+        "### Harness PR Review Agent\n\n"
+        f"{review.strip()}\n\n"
+        "_Posted by the Harness PR review agent._"
+    )
+
+
+def _comment_enabled() -> bool:
+    return os.environ.get("HARNESS_GITHUB_COMMENT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def _review_prompt(*, repo: str, pr_number: int, repo_path: Path) -> str:

@@ -44,3 +44,14 @@ stdin and does not mount the checkout into the container.
 The example requires Docker for the sandboxed project-check tool.
 It keeps its SQLite database by default so memories can carry across runs. Set
 `HARNESS_EXAMPLE_RESET_DB=1` to start from a clean database.
+
+To post the review as a PR comment:
+
+```bash
+export HARNESS_GITHUB_COMMENT=1
+```
+
+GitHub shows the comment author based on the token used. A personal token posts
+as that user; use a GitHub App or machine-user token if the comment should have
+a dedicated bot identity. The comment body is marked as coming from the Harness
+PR review agent.
