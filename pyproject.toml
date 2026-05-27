@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentic-harness"
+version = "0.1.0"
+description = "A production-oriented Python harness for agent sessions, tools, memory, observability, and sandboxed execution."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+  "aiosqlite>=0.20",
+  "anyio>=4.4",
+  "asyncpg>=0.29",
+  "httpx>=0.28",
+  "jsonschema>=4.22",
+  "nicegui>=2.0",
+  "pydantic>=2.7",
+  "pydantic-settings>=2.6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2",
+  "ty>=0.0.38",
+  "ruff>=0.5",
+]
+embeddings = [
+  "sentence-transformers>=3.0",
+]
+
+[project.scripts]
+harness = "harness.cli:main"
+harness-dashboard = "harness.dashboard.app:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness"]
+
+[tool.pytest.ini_options]
+addopts = ["--strict-markers", "--strict-config"]
+testpaths = ["tests"]
+markers = [
+  "e2e: tests that use real external models, embeddings, or runtimes",
+  "container: tests that require a container runtime",
+  "postgres: tests that require a Postgres service",
+  "provider: tests that call real external model providers",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ty.environment]
+root = ["./src", "./tests"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.ty.terminal]
+output-format = "concise"

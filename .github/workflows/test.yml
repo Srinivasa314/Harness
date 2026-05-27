@@ -1,0 +1,136 @@
+name: test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      run_openai:
+        description: Run OpenAI provider e2e using HARNESS_OPENAI_API_KEY secret
+        required: true
+        type: boolean
+        default: false
+      run_minilm:
+        description: Run MiniLM embedding e2e and allow model download/cache
+        required: true
+        type: boolean
+        default: false
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ["3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: uv sync --locked --extra dev --extra embeddings
+      - name: Lint
+        run: uv run ruff check
+      - name: Type check
+        run: uv run ty check
+      - name: Test
+        run: uv run pytest -m "not e2e and not container and not postgres and not provider"
+      - name: CLI smoke
+        run: |
+          uv run harness migrate
+          uv run harness doctor --output /tmp/harness-doctor.json
+      - name: Package smoke
+        run: |
+          uv build
+          uv venv data/wheel-smoke
+          uv pip install --python data/wheel-smoke/bin/python dist/*.whl
+          data/wheel-smoke/bin/python - <<'PY'
+          from harness.execution import DockerContainerExecutor, SubprocessExecutor
+          from harness.models import CodexCliProvider
+          print(DockerContainerExecutor.__name__, SubprocessExecutor.__name__, CodexCliProvider.__name__)
+          PY
+          data/wheel-smoke/bin/harness --help
+
+  container:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync --locked --extra dev
+      - name: Docker preflight
+        run: docker version
+      - name: Docker tests
+        run: uv run pytest -m container
+
+  postgres-e2e:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: harness
+          POSTGRES_PASSWORD: harness
+          POSTGRES_DB: harness_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U harness -d harness_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      HARNESS_POSTGRES_DSN: postgresql://harness:harness@127.0.0.1:5432/harness_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync --locked --extra dev
+      - name: Postgres e2e tests
+        run: uv run pytest -m postgres
+
+  provider-e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      HARNESS_OPENAI_API_KEY: ${{ secrets.HARNESS_OPENAI_API_KEY }}
+      HARNESS_OPENAI_MODEL: gpt-5.2
+      HF_HOME: ${{ github.workspace }}/data/hf-cache
+      SENTENCE_TRANSFORMERS_HOME: ${{ github.workspace }}/data/sentence-transformers
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install
+        run: uv sync --locked --extra dev
+      - name: Install MiniLM dependencies
+        if: inputs.run_minilm
+        run: uv sync --locked --extra dev --extra embeddings
+      - name: OpenAI provider e2e
+        if: inputs.run_openai
+        env:
+          HARNESS_RUN_OPENAI_E2E: "1"
+        run: |
+          test -n "$HARNESS_OPENAI_API_KEY"
+          uv run pytest -m provider \
+            tests/test_e2e_providers.py::test_openai_provider_e2e \
+            tests/test_e2e_providers.py::test_openai_embedding_provider_e2e
+      - name: MiniLM embedding e2e
+        if: inputs.run_minilm
+        env:
+          HARNESS_RUN_MINILM_E2E: "1"
+        run: uv run pytest -m e2e tests/test_e2e_providers.py::test_minilm_embedding_provider_e2e
+      - name: No provider e2e selected
+        if: ${{ !inputs.run_openai && !inputs.run_minilm }}
+        run: echo "No provider e2e inputs selected."

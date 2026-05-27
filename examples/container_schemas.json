@@ -1,0 +1,12 @@
+{
+  "schemas": [
+    {
+      "name": "default",
+      "image": "python:3.12-alpine",
+      "network": false,
+      "workdir": "/work",
+      "read_only_root": true,
+      "allow_secrets": false
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "tools": [
+    {
+      "name": "text.uppercase",
+      "description": "Uppercase text.",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": ["text"]
+      },
+      "required_capabilities": ["text:uppercase"],
+      "execution_mode": "subprocess",
+      "subprocess_command": ["python", "examples/uppercase_tool.py"]
+    }
+  ]
+}
