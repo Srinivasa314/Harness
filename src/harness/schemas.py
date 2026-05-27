@@ -83,6 +83,7 @@ class ContainerSchema(BaseModel):
     image: str
     network: bool = False
     mount: Path | None = None
+    mount_read_only: bool = True
     workdir: str = "/work"
     read_only_root: bool = True
     tmpfs_tmp: bool = True

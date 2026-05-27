@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -39,8 +38,15 @@ GITHUB_PAGE_SIZE = 100
 MAX_GITHUB_PAGES = 5
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
-MAX_REPO_FILES = 500
-MAX_CONFIG_CHARS = 4_000
+
+PROJECT_CHECKER = r"""
+from collections import Counter
+import json
+import os
+from pathlib import Path
+
+MAX_REPO_FILES = 2000
+MAX_CONFIG_CHARS = 20000
 CONFIG_FILENAMES = {
     ".github/dependabot.yml",
     ".github/dependabot.yaml",
@@ -80,13 +86,29 @@ SKIP_DIRS = {
     "target",
 }
 
-PROJECT_CHECKER = r"""
-from collections import Counter
-import json
+root = Path.cwd()
+files = []
+config_files = {}
+for current, dirs, filenames in os.walk(root):
+    dirs[:] = [dirname for dirname in dirs if dirname not in SKIP_DIRS]
+    for filename in filenames:
+        path = Path(current) / filename
+        relative = path.relative_to(root).as_posix()
+        files.append(relative)
+        if (
+            relative in CONFIG_FILENAMES
+            or filename in CONFIG_FILENAMES
+            or relative.startswith(".github/workflows/")
+        ):
+            try:
+                config_files[relative] = path.read_text(errors="replace")[:MAX_CONFIG_CHARS]
+            except OSError:
+                pass
+        if len(files) >= MAX_REPO_FILES:
+            break
+    if len(files) >= MAX_REPO_FILES:
+        break
 
-snapshot = json.loads(SNAPSHOT_JSON)
-files = [str(path) for path in snapshot.get("files", [])]
-config_files = snapshot.get("config_files", {})
 lower_files = [path.lower() for path in files]
 suffixes = Counter(path.rsplit(".", 1)[-1] for path in lower_files if "." in path)
 
@@ -183,8 +205,9 @@ if not security_indicators:
     notes.append("No common dependency or static-analysis security configuration was detected.")
 
 print(json.dumps({
-    "root_name": snapshot.get("root_name"),
+    "root_name": root.name,
     "file_count_sampled": len(files),
+    "file_sample_truncated": len(files) >= MAX_REPO_FILES,
     "top_extensions": suffixes.most_common(8),
     "languages": languages,
     "package_managers": sorted(set(package_managers)),
@@ -195,11 +218,6 @@ print(json.dumps({
     "notes": notes,
 }))
 """
-
-
-def project_checker_script(repo_snapshot: dict[str, Any]) -> str:
-    snapshot_json = json.dumps(repo_snapshot, sort_keys=True)
-    return f"SNAPSHOT_JSON = {snapshot_json!r}\n{PROJECT_CHECKER}"
 
 
 class PullRequestMemoryExtractor(MemoryExtractor):
@@ -318,6 +336,19 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
     }
 
 
+async def github_pr_comment(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, str]:
+    repo = str(arguments["repo"])
+    pr_number = int(arguments["pr_number"])
+    body = str(arguments["body"])
+    url = await post_pr_comment(
+        repo=repo,
+        pr_number=pr_number,
+        token=secrets["github_token"],
+        review=body,
+    )
+    return {"url": url}
+
+
 async def _get_paginated_list(
     client: httpx.AsyncClient,
     url: str,
@@ -347,7 +378,7 @@ async def _get_paginated_list(
     return items
 
 
-def build_registry(repo_snapshot: dict[str, Any]) -> ToolRegistry:
+def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
@@ -394,13 +425,40 @@ def build_registry(repo_snapshot: dict[str, Any]) -> ToolRegistry:
         ),
         github_pr_context,
     )
+    if enable_comment_tool:
+        registry.register(
+            ToolDefinition(
+                name="github.pr_comment",
+                description="Post the final review as a GitHub pull request comment.",
+                execution_mode=ExecutionMode.IN_PROCESS,
+                required_capabilities=["github:comment"],
+                required_secrets=["github_token"],
+                input_schema={
+                    "type": "object",
+                    "required": ["repo", "pr_number", "body"],
+                    "properties": {
+                        "repo": {"type": "string"},
+                        "pr_number": {"type": "integer"},
+                        "body": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                },
+                output_schema={
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {"url": {"type": "string"}},
+                    "additionalProperties": False,
+                },
+            ),
+            github_pr_comment,
+        )
     registry.register(
         ToolDefinition(
             name="repo.project_check",
             description="Analyze a local repository snapshot inside Docker.",
             execution_mode=ExecutionMode.CONTAINER,
             container_schema="python-analysis",
-            container_command=["python", "-c", project_checker_script(repo_snapshot)],
+            container_command=["python", "-c", PROJECT_CHECKER],
             required_capabilities=["repo:sandbox"],
             timeout_seconds=30,
             input_schema={
@@ -413,6 +471,7 @@ def build_registry(repo_snapshot: dict[str, Any]) -> ToolRegistry:
                 "required": [
                     "root_name",
                     "file_count_sampled",
+                    "file_sample_truncated",
                     "top_extensions",
                     "languages",
                     "package_managers",
@@ -425,6 +484,7 @@ def build_registry(repo_snapshot: dict[str, Any]) -> ToolRegistry:
                 "properties": {
                     "root_name": {"type": "string"},
                     "file_count_sampled": {"type": "integer"},
+                    "file_sample_truncated": {"type": "boolean"},
                     "top_extensions": {"type": "array"},
                     "languages": {"type": "array", "items": {"type": "string"}},
                     "package_managers": {"type": "array", "items": {"type": "string"}},
@@ -450,7 +510,10 @@ async def main() -> None:
     repo = os.environ.get("HARNESS_GITHUB_REPO", "")
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
-    repo_snapshot = _repo_snapshot(repo_path)
+    comment_enabled = _comment_enabled()
+    tool_capabilities = ["github:pr", "repo:sandbox"]
+    if comment_enabled:
+        tool_capabilities.append("github:comment")
     settings = HarnessSettings(
         storage_backend="sqlite",
         sqlite_path=DEMO_DB,
@@ -469,23 +532,25 @@ async def main() -> None:
         context_compaction_summarizer_input_max_chars=4_000,
         context_compaction_summary_max_chars=800,
         container_cleanup_delay_minutes=5,
-        tool_capabilities=["github:pr", "repo:sandbox"],
+        tool_capabilities=tool_capabilities,
         secret_backend="env",
     )
     await _preflight(settings, repo=repo, pr_number=pr_number, repo_path=repo_path)
 
     storage = SQLiteStorage(DEMO_DB)
     await storage.migrate()
-    registry = build_registry(repo_snapshot)
+    registry = build_registry(enable_comment_tool=comment_enabled)
     schemas = ContainerSchemaRegistry(
         [
             ContainerSchema(
                 name="python-analysis",
                 image="python:3.12-alpine",
+                mount=repo_path,
+                workdir="/repo",
                 network=False,
                 read_only_root=True,
                 tmpfs_tmp=True,
-                tmpfs_workdir=True,
+                tmpfs_workdir=False,
                 share_across_tools=True,
             )
         ]
@@ -501,6 +566,7 @@ async def main() -> None:
             ExecutionMode.CONTAINER: DockerContainerExecutor(
                 docker_bin=settings.docker_bin,
                 schemas=schemas,
+                allowed_mount_root=repo_path,
             ),
         },
         own_storage=True,
@@ -544,7 +610,7 @@ async def main() -> None:
                 repo=repo,
                 pr_number=pr_number,
                 repo_path=repo_path,
-                repo_snapshot=repo_snapshot,
+                comment_enabled=comment_enabled,
             ),
         )
 
@@ -552,16 +618,9 @@ async def main() -> None:
         tool_calls = await storage.list_tool_calls(session.id, limit=None)
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
-        comment_url = None
-        if _comment_enabled():
-            if not tool_calls:
-                raise RuntimeError("Refusing to comment because the review ran no tools.")
-            comment_url = await post_pr_comment(
-                repo=repo,
-                pr_number=pr_number,
-                token=os.environ["HARNESS_SECRET_GITHUB_TOKEN"],
-                review=result.final,
-            )
+        comment_url = _comment_url_from_results(result.tool_results)
+        if comment_enabled and comment_url is None:
+            raise RuntimeError("Review finished without posting a PR comment.")
 
         print(
             json.dumps(
@@ -631,14 +690,29 @@ def _comment_enabled() -> bool:
     }
 
 
+def _comment_url_from_results(results: list[Any]) -> str | None:
+    for result in results:
+        if getattr(result, "name", None) != "github.pr_comment" or result.status != "ok":
+            continue
+        output = result.output
+        if isinstance(output, dict) and isinstance(output.get("url"), str):
+            return output["url"]
+    return None
+
+
 def _review_prompt(
     *,
     repo: str,
     pr_number: int,
     repo_path: Path,
-    repo_snapshot: dict[str, Any],
+    comment_enabled: bool,
 ) -> str:
-    config_files = sorted(repo_snapshot.get("config_files", {}))
+    comment_instruction = (
+        "After drafting the review, call github.pr_comment with the exact review body. "
+        "After the comment tool succeeds, return a final answer that includes the comment URL."
+        if comment_enabled
+        else "Do not post a PR comment in this run; return the review as the final answer."
+    )
     return (
         "You are a GitHub PR review agent. Produce a concise code review with concrete "
         "findings, test gaps, and a release-readiness recommendation. Use the harness "
@@ -648,10 +722,8 @@ def _review_prompt(
         f"Local repository root: {repo_path}\n\n"
         "Required first tool batch: call github.pr_context with the repo and PR number "
         "and repo.project_check with empty arguments {}. The repo.project_check tool "
-        "already has access to a bounded local repository snapshot prepared by the "
-        "harness.\n\n"
-        f"Snapshot summary: {len(repo_snapshot.get('files', []))} files sampled; "
-        f"config files: {', '.join(config_files) if config_files else 'none'}."
+        "has read-only access to the local checkout at /repo inside Docker.\n\n"
+        f"{comment_instruction}"
     )
 
 
@@ -690,64 +762,6 @@ async def _preflight(
 def _target_repo_path() -> Path:
     raw_path = os.environ.get("HARNESS_REPO_PATH")
     return Path(raw_path).expanduser().resolve() if raw_path else Path.cwd().resolve()
-
-
-def _repo_snapshot(repo_path: Path) -> dict[str, Any]:
-    files = _repo_files(repo_path)
-    return {
-        "root_name": repo_path.name,
-        "files": files[:MAX_REPO_FILES],
-        "config_files": _read_config_files(repo_path, files),
-        "truncated": len(files) > MAX_REPO_FILES,
-    }
-
-
-def _repo_files(repo_path: Path) -> list[str]:
-    git_files = _git_files(repo_path)
-    if git_files:
-        return git_files
-    files: list[str] = []
-    for path in repo_path.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(repo_path)
-        parts = set(relative.parts)
-        if parts & SKIP_DIRS:
-            continue
-        files.append(relative.as_posix())
-        if len(files) >= MAX_REPO_FILES:
-            break
-    return sorted(files)
-
-
-def _git_files(repo_path: Path) -> list[str]:
-    result = subprocess.run(
-        ["git", "-C", str(repo_path), "ls-files"],
-        check=False,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        return []
-    return sorted(
-        line.strip()
-        for line in result.stdout.decode(errors="replace").splitlines()
-        if line.strip()
-    )
-
-
-def _read_config_files(repo_path: Path, files: list[str]) -> dict[str, str]:
-    configs: dict[str, str] = {}
-    for relative in files:
-        if relative not in CONFIG_FILENAMES and Path(relative).name not in CONFIG_FILENAMES:
-            continue
-        path = (repo_path / relative).resolve()
-        if not path.is_relative_to(repo_path) or not path.is_file():
-            continue
-        try:
-            configs[relative] = path.read_text(errors="replace")[:MAX_CONFIG_CHARS]
-        except OSError:
-            continue
-    return configs
 
 
 def _load_local_env_file(path: Path) -> None:

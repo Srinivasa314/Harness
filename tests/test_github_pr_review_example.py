@@ -12,58 +12,40 @@ import httpx
 import pytest
 
 
-def test_github_pr_example_repo_snapshot_is_generic(tmp_path: Path) -> None:
+def test_github_pr_example_project_checker_detects_generic_repo(tmp_path: Path) -> None:
     module = _load_example_module()
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    (repo / "pyproject.toml").write_text("[project]\nname = 'other-project'\n")
-    (repo / "package.json").write_text('{"scripts": {"test": "vitest"}}')
-    (repo / "src").mkdir()
-    (repo / "src" / "main.ts").write_text("export const value = 1;\n")
-    (repo / "node_modules").mkdir()
-    (repo / "node_modules" / "ignored.js").write_text("")
-
-    snapshot = module._repo_snapshot(repo)
-
-    assert snapshot["root_name"] == "repo"
-    assert "pyproject.toml" in snapshot["config_files"]
-    assert "package.json" in snapshot["config_files"]
-    assert "src/main.ts" in snapshot["files"]
-    assert "node_modules/ignored.js" not in snapshot["files"]
-
-
-def test_github_pr_example_project_checker_detects_generic_repo() -> None:
-    module = _load_example_module()
-    snapshot = {
-        "root_name": "service",
-        "files": [
-            ".github/workflows/test.yml",
-            "Dockerfile",
-            "go.mod",
-            "main.go",
-            "main_test.go",
-        ],
-        "config_files": {
-            "go.mod": "module example.com/service\n",
-            ".github/workflows/test.yml": "name: test\nrun: go test ./...\n",
-        },
-    }
-
+    repo = _generic_repo(tmp_path)
     completed = subprocess.run(
-        [sys.executable, "-c", module.project_checker_script(snapshot)],
+        [sys.executable, "-c", module.PROJECT_CHECKER],
         text=True,
         check=True,
         capture_output=True,
+        cwd=repo,
     )
+
     result = json.loads(completed.stdout)
 
-    assert result["root_name"] == "service"
+    assert result["root_name"] == "repo"
     assert "go" in result["languages"]
     assert "go modules" in result["package_managers"]
     assert "go test" in result["test_indicators"]
     assert "test files present" in result["test_indicators"]
     assert result["ci_present"] is True
     assert result["container_files"] == ["Dockerfile"]
+
+
+def test_github_pr_example_comment_tool_is_optional() -> None:
+    module = _load_example_module()
+
+    without_comment = module.build_registry(enable_comment_tool=False)
+    with_comment = module.build_registry(enable_comment_tool=True)
+    without_comment_names = {
+        definition.name for definition in without_comment.list_definitions()
+    }
+    with_comment_names = {definition.name for definition in with_comment.list_definitions()}
+
+    assert "github.pr_comment" not in without_comment_names
+    assert "github.pr_comment" in with_comment_names
 
 
 @pytest.mark.anyio
@@ -193,3 +175,17 @@ def _load_example_module() -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def _generic_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / ".github" / "workflows").mkdir(parents=True)
+    (repo / ".github" / "workflows" / "test.yml").write_text("name: test\nrun: go test ./...\n")
+    (repo / "Dockerfile").write_text("FROM scratch\n")
+    (repo / "go.mod").write_text("module example.com/service\n")
+    (repo / "main.go").write_text("package main\n")
+    (repo / "main_test.go").write_text("package main\n")
+    (repo / "node_modules").mkdir()
+    (repo / "node_modules" / "ignored.js").write_text("")
+    return repo

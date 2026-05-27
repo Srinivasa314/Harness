@@ -2607,6 +2607,87 @@ async def test_docker_executor_rejects_mount_outside_allowed_root(tmp_path):
     assert "outside the allowed mount root" in (result.error or "")
 
 
+@pytest.mark.anyio
+async def test_docker_executor_mounts_allowed_directory_read_only_by_default(
+    tmp_path,
+    monkeypatch,
+):
+    from harness.execution import container as container_module
+
+    commands: list[list[str]] = []
+
+    class Completed:
+        returncode = 0
+        stdout = b'{"ok": true}'
+        stderr = b""
+
+    async def fake_run_process(command, **kwargs):  # noqa: ANN001
+        _ = kwargs
+        commands.append(command)
+        return Completed()
+
+    monkeypatch.setattr(container_module.anyio, "run_process", fake_run_process)
+    monkeypatch.setattr(container_module, "run_limited_process", fake_run_process)
+    executor = DockerContainerExecutor(
+        docker_bin="docker",
+        allowed_mount_root=tmp_path,
+        schemas=_schemas(_schema(mount=tmp_path)),
+    )
+    definition = ToolDefinition(
+        name="container",
+        description="Container",
+        execution_mode=ExecutionMode.CONTAINER,
+        container_command=["python", "-c", "print('{}')"],
+    )
+
+    result = await executor.execute(
+        definition, ToolCall(session_id="session-1", name="container"), {}
+    )
+
+    assert result.status == "ok"
+    run_command = next(command for command in commands if command[1] == "run")
+    assert f"{tmp_path.resolve()}:/work:ro" in run_command
+
+
+@pytest.mark.anyio
+async def test_docker_executor_can_mount_allowed_directory_read_write(tmp_path, monkeypatch):
+    from harness.execution import container as container_module
+
+    commands: list[list[str]] = []
+
+    class Completed:
+        returncode = 0
+        stdout = b'{"ok": true}'
+        stderr = b""
+
+    async def fake_run_process(command, **kwargs):  # noqa: ANN001
+        _ = kwargs
+        commands.append(command)
+        return Completed()
+
+    monkeypatch.setattr(container_module.anyio, "run_process", fake_run_process)
+    monkeypatch.setattr(container_module, "run_limited_process", fake_run_process)
+    executor = DockerContainerExecutor(
+        docker_bin="docker",
+        allowed_mount_root=tmp_path,
+        schemas=_schemas(_schema(mount=tmp_path, mount_read_only=False)),
+    )
+    definition = ToolDefinition(
+        name="container",
+        description="Container",
+        execution_mode=ExecutionMode.CONTAINER,
+        container_command=["python", "-c", "print('{}')"],
+    )
+
+    result = await executor.execute(
+        definition, ToolCall(session_id="session-1", name="container"), {}
+    )
+
+    assert result.status == "ok"
+    run_command = next(command for command in commands if command[1] == "run")
+    assert f"{tmp_path.resolve()}:/work:rw" in run_command
+
+
 @pytest.mark.container
 @pytest.mark.anyio
 async def test_docker_container_executor(storage):
