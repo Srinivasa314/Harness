@@ -560,6 +560,8 @@ async def main() -> None:
         memories = await storage.list_memories("github-pr-review-demo")
         comment_url = None
         if _comment_enabled():
+            if not tool_calls:
+                raise RuntimeError("Refusing to comment because the review ran no tools.")
             comment_url = await post_pr_comment(
                 repo=repo,
                 pr_number=pr_number,
