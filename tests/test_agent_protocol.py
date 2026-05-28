@@ -47,7 +47,7 @@ def test_parse_model_action_accepts_tool_call_prefix_with_extra_text():
     assert action.tool_calls[0].arguments == {"text": "hello"}
 
 
-def test_parse_model_action_accepts_tool_calls_nested_inside_final_string():
+def test_parse_model_action_treats_tool_calls_nested_inside_final_string_as_final():
     action = parse_model_action(
         ModelResponse(
             content=(
@@ -57,9 +57,8 @@ def test_parse_model_action_accepts_tool_calls_nested_inside_final_string():
         )
     )
 
-    assert action.kind == "tool_calls"
-    assert action.tool_calls[0].name == "text.uppercase"
-    assert action.tool_calls[0].arguments == {"text": "hello"}
+    assert action.kind == "final"
+    assert '"tool_calls"' in action.content
 
 
 def test_parse_model_action_prefers_native_tool_calls():

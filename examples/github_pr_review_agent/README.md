@@ -46,8 +46,10 @@ uv sync --extra dev --extra embeddings
 uv run python examples/github_pr_review_agent/agent.py
 ```
 
-`HARNESS_REPO_PATH` should point to a local checkout for the repository being
-reviewed. If it is omitted, the example analyzes the current working directory.
+`HARNESS_REPO_PATH` should point to a clean local clone for the repository being
+reviewed. Prefer a temporary clone created specifically for the review so local
+ignored files, caches, and credentials are not present in the mounted tree. If
+it is omitted, the example analyzes the current working directory.
 The `repo.bash` tool mounts that checkout read-only at `/repo` so the agent can
 explore files and configuration with shell commands without being able to modify
 the host directory. The container has no network access.
@@ -68,8 +70,10 @@ agent comments, skips comments already processed in its local SQLite tracking
 table, and stores durable preference memories at agent scope for later PR
 reviews in the same namespace. Each run uses a new Harness session; memory
 provides continuity across runs. The agent reads unread PR replies through the
-`github.pr_replies` tool; relevant stored preferences are retrieved by Harness
-memory and injected into model context automatically.
+`github.pr_replies` tool. Replies are accepted only from the PR author or users
+GitHub marks as members/owners of the repository organization. Relevant stored
+preferences are retrieved by Harness memory and injected into model context
+automatically.
 
 Commenting is done by the agent through the `github.pr_comment` tool after it
 has run `github.pr_context` and explored the checkout with `repo.bash`.

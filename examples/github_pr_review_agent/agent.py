@@ -5,7 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import aiosqlite
 import anyio
@@ -42,6 +42,7 @@ GITHUB_PAGE_SIZE = 100
 MAX_GITHUB_PAGES = 5
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
+TRUSTED_REPLY_ASSOCIATIONS = {"MEMBER", "OWNER"}
 PREFERENCE_MARKERS = (
     "always",
     "avoid",
@@ -343,12 +344,19 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
     }
     comments: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=60) as client:
+        pr_response = await client.get(
+            f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
+            headers=headers,
+        )
+        pr_response.raise_for_status()
+        pr = pr_response.json()
         comments = await _get_paginated_list(
             client,
             f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
             headers=headers,
             list_key=None,
         )
+    pr_author = _github_login(pr.get("user"))
     last_agent_index = -1
     for index, comment in enumerate(comments):
         body = comment.get("body")
@@ -365,6 +373,8 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
             continue
         if not isinstance(comment_id, int):
             continue
+        if not _is_trusted_reply_author(comment, pr_author=pr_author):
+            continue
         replies.append(
             PullRequestReply(
                 comment_id=comment_id,
@@ -373,6 +383,21 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
             )
         )
     return replies
+
+
+def _github_login(user: object) -> str | None:
+    if not isinstance(user, dict):
+        return None
+    login = cast(dict[str, Any], user).get("login")
+    return login if isinstance(login, str) and login else None
+
+
+def _is_trusted_reply_author(comment: dict[str, Any], *, pr_author: str | None) -> bool:
+    author = _github_login(comment.get("user"))
+    if author is not None and pr_author is not None and author == pr_author:
+        return True
+    association = comment.get("author_association")
+    return association in TRUSTED_REPLY_ASSOCIATIONS
 
 
 def _reply_payload(reply: PullRequestReply) -> dict[str, Any]:
@@ -682,7 +707,6 @@ async def main() -> None:
 
         loop = runtime.agent_loop(
             max_iterations=int(os.environ.get("HARNESS_PR_REVIEW_MAX_ITERATIONS", "32")),
-            stop_after_tools={"github.pr_comment"},
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
@@ -882,8 +906,7 @@ def _review_prompt(
         "repo.bash runs inside Docker with no network and read-only access to the "
         "local checkout at /repo. "
         "Prefer cheap read-only commands such as find, sed, grep, python one-liners, "
-        "and test/config discovery. Do not inspect .env*, .git, .venv, data, dist, local "
-        "caches, credential files, or secret-looking files. Do not use git, rg, package "
+        "and test/config discovery. Do not use git, rg, package "
         "managers, network access, or commands that write to the repository. If a command "
         "is unavailable or fails, adapt with simpler POSIX tools.\n\n"
         "Produce a concise code review with concrete findings, test gaps, and a "
