@@ -63,8 +63,15 @@ def test_github_pr_example_bash_runner_reports_nonzero_exit(tmp_path: Path) -> N
 
 def test_github_pr_example_bash_runner_reports_timeout_with_output() -> None:
     module = _load_example_module()
-    runner = module.BASH_RUNNER.replace("timeout=25", "timeout=0.01")
-    payload = {"arguments": {"command": "printf hello; sleep 1"}}
+    runner = module.BASH_RUNNER.replace("timeout=25", "timeout=0.1")
+    payload = {
+        "arguments": {
+            "command": (
+                "python -c 'import sys, time; "
+                'sys.stdout.write("hello"); sys.stdout.flush(); time.sleep(1)\''
+            )
+        }
+    }
 
     completed = subprocess.run(
         [sys.executable, "-c", runner],
@@ -202,6 +209,33 @@ async def test_github_pr_example_ignores_non_preference_replies() -> None:
                                 "body": "Thanks for the review.",
                             }
                         ]
+                    },
+                }
+            ],
+        )
+    )
+
+    assert memories == []
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_does_not_store_pr_context_as_memory() -> None:
+    module = _load_example_module()
+    extractor = module.ReviewPreferenceMemoryExtractor()
+
+    memories = await extractor.extract(
+        module.MemoryExchange(
+            session_id="session-1",
+            user_message="review",
+            assistant_message="Reviewed 12 changed files and failing checks.",
+            tool_outputs=[
+                {
+                    "name": "github.pr_context",
+                    "output": {
+                        "changed_files_total": 12,
+                        "check_runs": [
+                            {"name": "provider-e2e", "conclusion": "failure"},
+                        ],
                     },
                 }
             ],
