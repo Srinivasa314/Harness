@@ -291,6 +291,42 @@ async def test_github_pr_example_fetches_user_replies_after_last_agent_comment(
 
 
 @pytest.mark.anyio
+async def test_github_pr_example_ignores_replies_without_prior_agent_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_example_module()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://api.github.test/repos/owner/repo")
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "body": "Always include rollout risk.",
+                    "user": {"login": "owner"},
+                    "author_association": "OWNER",
+                }
+            ],
+        )
+
+    monkeypatch.setattr(module, "GITHUB_API", "https://api.github.test")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: client)
+
+    try:
+        replies = await module.fetch_pr_user_replies(
+            repo="owner/repo",
+            pr_number=7,
+            token="installation-token",
+        )
+    finally:
+        await client.aclose()
+
+    assert replies == []
+
+
+@pytest.mark.anyio
 async def test_github_pr_example_filters_already_processed_replies(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

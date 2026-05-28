@@ -69,9 +69,10 @@ agent comments, skips comments already processed in its local SQLite tracking
 table, and stores durable preference memories at agent scope for later PR
 reviews in the same namespace. Each run uses a new Harness session; memory
 provides continuity across runs. The agent reads unread PR replies through the
-`github.pr_replies` tool. Replies are accepted only from users GitHub marks as
-members/owners of the repository organization. Relevant stored preferences are
-retrieved by Harness memory and injected into model context automatically.
+`github.pr_replies` tool. Replies are accepted only after the latest Harness
+agent comment and only from users GitHub marks as repository owners. Relevant
+stored preferences are retrieved by Harness memory and injected into model
+context automatically.
 
 Commenting is done by the agent through the `github.pr_comment` tool after it
 has run `github.pr_context` and explored the checkout with `repo.bash`.

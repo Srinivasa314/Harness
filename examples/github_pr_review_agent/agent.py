@@ -366,6 +366,8 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
         body = comment.get("body")
         if isinstance(body, str) and AGENT_COMMENT_MARKER in body:
             last_agent_index = index
+    if last_agent_index < 0:
+        return []
     replies: list[PullRequestReply] = []
     for comment in comments[last_agent_index + 1:]:
         body = comment.get("body")
@@ -670,6 +672,7 @@ async def main() -> None:
                 workdir="/repo",
                 network=False,
                 read_only_root=True,
+                mount_read_only=True,
                 tmpfs_tmp=True,
                 tmpfs_workdir=False,
                 share_across_tools=True,
