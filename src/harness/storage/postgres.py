@@ -201,6 +201,23 @@ class PostgresStorage(StorageBackend):
             metadata=from_json(row["metadata"], {}),
         )
 
+    async def list_sessions(self, limit: int | None = 100) -> list[Session]:
+        pool = await self._get_pool()
+        query = "select * from sessions order by created_at desc"
+        args: list[int] = []
+        if limit is not None:
+            query += " limit $1"
+            args.append(limit)
+        rows = await pool.fetch(query, *args)
+        return [
+            Session(
+                id=row["id"],
+                created_at=row["created_at"],
+                metadata=from_json(row["metadata"], {}),
+            )
+            for row in rows
+        ]
+
     async def try_acquire_session_lease(
         self,
         session_id: str,

@@ -42,6 +42,7 @@ async def _exercise_storage_contract(storage: StorageBackend) -> None:
     session = Session(metadata={"suite": "contract"})
     await storage.create_session(session)
     assert (await storage.get_session(session.id)) == session
+    assert (await storage.list_sessions(limit=1))[0] == session
     assert await storage.try_acquire_session_lease(session.id, "owner-a", ttl_seconds=300)
     assert not await storage.try_acquire_session_lease(session.id, "owner-b", ttl_seconds=300)
     await storage.release_session_lease(session.id, "owner-b")

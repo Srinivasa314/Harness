@@ -32,6 +32,10 @@ class StorageBackend(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    async def list_sessions(self, limit: int | None = 100) -> list[Session]:
+        raise NotImplementedError
+
+    @abstractmethod
     async def try_acquire_session_lease(
         self,
         session_id: str,

@@ -179,6 +179,24 @@ class SQLiteStorage(StorageBackend):
             metadata=from_json(row["metadata"], {}),
         )
 
+    async def list_sessions(self, limit: int | None = 100) -> list[Session]:
+        query = "select * from sessions order by created_at desc"
+        args: list[int] = []
+        if limit is not None:
+            query += " limit ?"
+            args.append(limit)
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(query, args)
+        return [
+            Session(
+                id=row["id"],
+                created_at=row["created_at"],
+                metadata=from_json(row["metadata"], {}),
+            )
+            for row in rows
+        ]
+
     async def try_acquire_session_lease(
         self,
         session_id: str,

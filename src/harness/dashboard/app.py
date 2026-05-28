@@ -11,7 +11,11 @@ from harness.config import load_settings
 from harness.dashboard.viewmodels import (
     artifact_rows,
     event_rows,
+    session_options,
+    session_summary_rows,
+    summary_cards,
     tool_call_rows,
+    tool_status_rows,
     turn_rows,
 )
 from harness.storage import SQLiteStorage, create_storage
@@ -35,34 +39,78 @@ def build_app(db_path: str | Path | None = None) -> None:
     @ui.page("/")
     async def index() -> None:
         await ensure_migrated()
-        events = await storage.list_events(limit=50)
-        recent_session_id = next((event.session_id for event in events if event.session_id), None)
-        active_session_id = recent_session_id or ""
-        turns = await storage.list_turns(active_session_id, limit=50) if active_session_id else []
-        tool_calls = await storage.list_tool_calls(
-            session_id=active_session_id or None,
-            limit=50,
-        )
-        artifacts = await storage.list_artifacts(session_id=active_session_id or None, limit=50)
+        sessions = await storage.list_sessions(limit=200)
+        active_session_id = ""
+        events = await storage.list_events(limit=500)
+        turns = await _turns_for_session(active_session_id)
+        tool_calls = await storage.list_tool_calls(limit=500)
+        artifacts = await storage.list_artifacts(limit=500)
 
         ui.label("Agentic Harness").classes("text-2xl font-bold")
-        with ui.row().classes("items-center"):
-            ui.input("Session", value=active_session_id).props("dense readonly")
+        ui.label("Observability dashboard").classes("text-sm text-gray-600")
+        with ui.row().classes("items-end gap-4"):
+            session_select = ui.select(
+                session_options(sessions),
+                value=active_session_id,
+                label="Session",
+            ).props("dense outlined").classes("min-w-[24rem]")
             tool_status = ui.select(
                 ["", "ok", "error", "denied", "timeout"],
                 value="",
                 label="Tool status",
-            ).props("dense")
+            ).props("dense outlined").classes("min-w-[12rem]")
+
+        with ui.row().classes("w-full gap-3"):
+            for card in summary_cards(
+                sessions=sessions,
+                events=events,
+                turns=turns,
+                tool_calls=tool_calls,
+                artifacts=artifacts,
+            ):
+                with ui.card().classes("min-w-[8rem] p-3"):
+                    ui.label(card["label"]).classes("text-xs uppercase text-gray-500")
+                    ui.label(card["value"]).classes("text-2xl font-semibold")
 
         with ui.tabs().classes("w-full") as tabs:
-            sessions_tab = ui.tab("Events")
+            overview_tab = ui.tab("Overview")
+            events_tab = ui.tab("Events")
             turns_tab = ui.tab("Turns")
             tools_tab = ui.tab("Tool Calls")
             artifacts_tab = ui.tab("Artifacts")
 
-        with ui.tab_panels(tabs, value=sessions_tab).classes("w-full"):
-            with ui.tab_panel(sessions_tab):
-                ui.table(
+        with ui.tab_panels(tabs, value=overview_tab).classes("w-full"):
+            with ui.tab_panel(overview_tab):
+                session_table = ui.table(
+                    columns=[
+                        {"name": "created_at", "label": "Created", "field": "created_at"},
+                        {"name": "id", "label": "Session", "field": "id"},
+                        {"name": "events", "label": "Events", "field": "events"},
+                        {"name": "turns", "label": "Turns", "field": "turns"},
+                        {"name": "tool_calls", "label": "Tool Calls", "field": "tool_calls"},
+                        {"name": "tool_issues", "label": "Tool Issues", "field": "tool_issues"},
+                        {"name": "artifacts", "label": "Artifacts", "field": "artifacts"},
+                        {"name": "detail", "label": "Detail", "field": "detail"},
+                    ],
+                    rows=session_summary_rows(
+                        sessions,
+                        events=events,
+                        turns=turns,
+                        tool_calls=tool_calls,
+                        artifacts=artifacts,
+                    ),
+                    row_key="id",
+                ).classes("w-full")
+                status_table = ui.table(
+                    columns=[
+                        {"name": "status", "label": "Status", "field": "status"},
+                        {"name": "count", "label": "Count", "field": "count"},
+                    ],
+                    rows=tool_status_rows(tool_calls),
+                    row_key="status",
+                ).classes("w-full")
+            with ui.tab_panel(events_tab):
+                events_table = ui.table(
                     columns=[
                         {"name": "ts", "label": "Time", "field": "ts"},
                         {"name": "event_type", "label": "Event", "field": "event_type"},
@@ -73,7 +121,7 @@ def build_app(db_path: str | Path | None = None) -> None:
                     row_key="ts",
                 ).classes("w-full")
             with ui.tab_panel(turns_tab):
-                ui.table(
+                turns_table = ui.table(
                     columns=[
                         {"name": "created_at", "label": "Created", "field": "created_at"},
                         {"name": "session_id", "label": "Session", "field": "session_id"},
@@ -95,7 +143,7 @@ def build_app(db_path: str | Path | None = None) -> None:
                     row_key="id",
                 ).classes("w-full")
             with ui.tab_panel(artifacts_tab):
-                ui.table(
+                artifacts_table = ui.table(
                     columns=[
                         {"name": "created_at", "label": "Created", "field": "created_at"},
                         {"name": "path", "label": "Path", "field": "path"},
@@ -105,11 +153,50 @@ def build_app(db_path: str | Path | None = None) -> None:
                     rows=artifact_rows(artifacts),
                     row_key="id",
                 ).classes("w-full")
-        def refresh_tool_filter(_event: object = None) -> None:
-            tools_table.rows = tool_call_rows(tool_calls, status=tool_status.value or None)
-            tools_table.update()
 
-        tool_status.on_value_change(refresh_tool_filter)
+        async def refresh_dashboard(_event: object = None) -> None:
+            selected_session = session_select.value or None
+            next_events = await storage.list_events(session_id=selected_session, limit=500)
+            next_turns = await _turns_for_session(selected_session or "")
+            next_tool_calls = await storage.list_tool_calls(session_id=selected_session, limit=500)
+            next_artifacts = await storage.list_artifacts(session_id=selected_session, limit=500)
+            events_table.rows = event_rows(next_events)
+            turns_table.rows = turn_rows(next_turns)
+            tools_table.rows = tool_call_rows(next_tool_calls, status=tool_status.value or None)
+            artifacts_table.rows = artifact_rows(next_artifacts)
+            if selected_session:
+                shown_sessions = [session for session in sessions if session.id == selected_session]
+            else:
+                shown_sessions = sessions
+            session_table.rows = session_summary_rows(
+                shown_sessions,
+                events=next_events,
+                turns=next_turns,
+                tool_calls=next_tool_calls,
+                artifacts=next_artifacts,
+            )
+            status_table.rows = tool_status_rows(next_tool_calls)
+            for table in (
+                events_table,
+                turns_table,
+                tools_table,
+                artifacts_table,
+                session_table,
+                status_table,
+            ):
+                table.update()
+
+        tool_status.on_value_change(refresh_dashboard)
+        session_select.on_value_change(refresh_dashboard)
+
+    async def _turns_for_session(session_id: str) -> list:
+        if session_id:
+            return await storage.list_turns(session_id, limit=500)
+        sessions = await storage.list_sessions(limit=50)
+        turns = []
+        for session in sessions:
+            turns.extend(await storage.list_turns(session.id, limit=50))
+        return turns[:500]
 
     @ui.page("/sessions/{session_id}")
     async def session_detail(session_id: str) -> None:
