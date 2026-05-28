@@ -67,9 +67,9 @@ The example reads PR comments after the latest Harness agent comment, ignores
 agent comments, skips comments already processed in its local SQLite tracking
 table, and stores durable preference memories at agent scope for later PR
 reviews in the same namespace. Each run uses a new Harness session; memory
-provides continuity across runs. The agent accesses this through tools:
-`github.pr_replies` checks for unread PR replies and `memory.search` retrieves
-relevant stored preferences.
+provides continuity across runs. The agent reads unread PR replies through the
+`github.pr_replies` tool; relevant stored preferences are retrieved by Harness
+memory and injected into model context automatically.
 
 To post the review as a PR comment:
 

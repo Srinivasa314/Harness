@@ -532,8 +532,6 @@ def register_run_tools(
     registry: ToolRegistry,
     *,
     storage: SQLiteStorage,
-    memory: Any,
-    session_id: str,
 ) -> None:
     async def github_pr_replies(
         arguments: dict[str, Any],
@@ -549,23 +547,6 @@ def register_run_tools(
             token=token,
         )
         return {"replies": [_reply_payload(reply) for reply in replies]}
-
-    async def memory_search(arguments: dict[str, Any], _secrets: dict[str, str]) -> dict[str, Any]:
-        query = str(arguments["query"])
-        context = await memory.context_for(query, session_id=session_id)
-        return {
-            "content": context.content,
-            "memories": [
-                {
-                    "id": item.memory.id,
-                    "scope": item.memory.scope.value,
-                    "text": item.memory.text,
-                    "score": item.score,
-                    "metadata": item.memory.metadata,
-                }
-                for item in context.memories
-            ],
-        }
 
     registry.register(
         ToolDefinition(
@@ -610,44 +591,6 @@ def register_run_tools(
         ),
         github_pr_replies,
     )
-    registry.register(
-        ToolDefinition(
-            name="memory.search",
-            description="Search durable memory for relevant review preferences and context.",
-            execution_mode=ExecutionMode.IN_PROCESS,
-            required_capabilities=["memory:search"],
-            input_schema={
-                "type": "object",
-                "required": ["query"],
-                "properties": {"query": {"type": "string"}},
-                "additionalProperties": False,
-            },
-            output_schema={
-                "type": "object",
-                "required": ["content", "memories"],
-                "properties": {
-                    "content": {"type": "string"},
-                    "memories": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["id", "scope", "text", "score", "metadata"],
-                            "properties": {
-                                "id": {"type": "string"},
-                                "scope": {"type": "string"},
-                                "text": {"type": "string"},
-                                "score": {"type": "number"},
-                                "metadata": {"type": "object"},
-                            },
-                            "additionalProperties": False,
-                        },
-                    },
-                },
-                "additionalProperties": False,
-            },
-        ),
-        memory_search,
-    )
 
 
 async def main() -> None:
@@ -660,7 +603,7 @@ async def main() -> None:
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
     comment_enabled = _comment_enabled()
-    tool_capabilities = ["github:pr", "github:replies", "memory:search", "repo:sandbox"]
+    tool_capabilities = ["github:pr", "github:replies", "repo:sandbox"]
     if comment_enabled:
         tool_capabilities.append("github:comment")
     settings = HarnessSettings(
@@ -739,12 +682,7 @@ async def main() -> None:
             }
         )
         await storage.create_session(session)
-        register_run_tools(
-            registry,
-            storage=storage,
-            memory=runtime.memory,
-            session_id=session.id,
-        )
+        register_run_tools(registry, storage=storage)
 
         loop = runtime.agent_loop(
             max_iterations=int(os.environ.get("HARNESS_PR_REVIEW_MAX_ITERATIONS", "32")),
@@ -948,9 +886,11 @@ def _review_prompt(
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
         f"Local repository root: {repo_path}\n\n"
-        "First, call github.pr_replies and memory.search. Use github.pr_replies to check "
-        "for unprocessed user replies on the PR. Use memory.search to retrieve relevant "
-        "review preferences and prior context. If github.pr_replies returns replies, "
+        "Harness may include relevant stored review preferences in the model context. "
+        "Apply those preferences when reviewing, but do not use a memory tool; memory "
+        "is managed by the runtime.\n\n"
+        "First, call github.pr_replies to check "
+        "for unprocessed user replies on the PR. If github.pr_replies returns replies, "
         "treat them as follow-up feedback. If they contain durable review preferences, "
         "they will be captured into memory after the run. In that case, do not run a "
         "fresh code review unless the replies explicitly ask for one; return a brief "

@@ -86,23 +86,12 @@ def test_github_pr_example_registers_run_scoped_tools(tmp_path: Path) -> None:
     registry = module.build_registry(enable_comment_tool=False)
     storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
 
-    class FakeMemory:
-        async def context_for(self, query: str, *, session_id: str):
-            assert query == "preferences"
-            assert session_id == "session-1"
-            return type("Context", (), {"content": "", "memories": []})()
-
-    module.register_run_tools(
-        registry,
-        storage=storage,
-        memory=FakeMemory(),
-        session_id="session-1",
-    )
+    module.register_run_tools(registry, storage=storage)
     definitions = {definition.name: definition for definition in registry.list_definitions()}
 
     assert definitions["github.pr_replies"].required_capabilities == ["github:replies"]
     assert definitions["github.pr_replies"].required_secrets == ["github_app_private_key"]
-    assert definitions["memory.search"].required_capabilities == ["memory:search"]
+    assert "memory.search" not in definitions
 
 
 @pytest.mark.anyio
