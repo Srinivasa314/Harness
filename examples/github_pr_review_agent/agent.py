@@ -625,6 +625,10 @@ async def main() -> None:
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
     tool_capabilities = ["github:pr", "github:replies", "github:comment", "repo:sandbox"]
+    context_max_chars = int(os.environ.get("HARNESS_PR_REVIEW_CONTEXT_MAX_CHARS", "120000"))
+    context_trigger_ratio = float(
+        os.environ.get("HARNESS_PR_REVIEW_COMPACTION_TRIGGER_RATIO", "0.75")
+    )
     settings = HarnessSettings(
         storage_backend="sqlite",
         sqlite_path=DEMO_DB,
@@ -637,8 +641,8 @@ async def main() -> None:
         memory_retrieval_limit=4,
         memory_max_context_chars=1_500,
         context_compaction_enabled=True,
-        context_max_chars=18_000,
-        context_compaction_trigger_ratio=0.35,
+        context_max_chars=context_max_chars,
+        context_compaction_trigger_ratio=context_trigger_ratio,
         context_compaction_preserve_recent_messages=4,
         context_compaction_summarizer_input_max_chars=4_000,
         context_compaction_summary_max_chars=800,
@@ -717,8 +721,8 @@ async def main() -> None:
                 model,
                 ContextCompactionPolicy(
                     enabled=True,
-                    max_context_chars=18_000,
-                    trigger_ratio=0.35,
+                    max_context_chars=context_max_chars,
+                    trigger_ratio=context_trigger_ratio,
                     preserve_recent_messages=4,
                     summarizer_input_max_chars=4_000,
                     summary_max_chars=800,

@@ -61,6 +61,9 @@ container has no network access.
 The example requires Docker for the sandboxed project-check tool.
 It keeps its SQLite database by default so memories can carry across runs. Set
 `HARNESS_EXAMPLE_RESET_DB=1` to start from a clean database.
+Context compaction is enabled with conservative defaults for this example. Use
+`HARNESS_PR_REVIEW_CONTEXT_MAX_CHARS` and
+`HARNESS_PR_REVIEW_COMPACTION_TRIGGER_RATIO` to tune when long reviews compact.
 
 To teach review preferences, reply on the GitHub PR after the agent's comment,
 then rerun the example:
