@@ -27,7 +27,6 @@ class MemoryStore:
         metadata: dict | None = None,
         *,
         scope: MemoryScope = MemoryScope.AGENT,
-        importance: float = 0.5,
         confidence: float = 1.0,
         source_session_id: str | None = None,
         source_turn_id: str | None = None,
@@ -45,7 +44,6 @@ class MemoryStore:
             embedding_dimensions=embedding_metadata.dimensions,
             metadata=redact(metadata or {}),
             scope=scope,
-            importance=importance,
             confidence=confidence,
             source_session_id=source_session_id,
             source_turn_id=source_turn_id,
@@ -78,7 +76,6 @@ class MemoryStore:
         ranked.sort(
             key=lambda item: (
                 item.score,
-                item.memory.importance,
                 item.memory.confidence,
                 item.memory.updated_at,
             ),

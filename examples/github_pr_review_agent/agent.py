@@ -3,11 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 import anyio
 import httpx
+import jwt
 
 from harness.agent import ContextCompactionPolicy, RollingSummaryContextCompactor
 from harness.config import HarnessSettings
@@ -38,6 +40,18 @@ GITHUB_PAGE_SIZE = 100
 MAX_GITHUB_PAGES = 5
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
+PREFERENCE_MARKERS = (
+    "always",
+    "avoid",
+    "don't",
+    "do not",
+    "focus",
+    "include",
+    "never",
+    "prefer",
+    "prioritize",
+    "skip",
+)
 
 BASH_RUNNER = r"""
 import json
@@ -77,62 +91,56 @@ print(json.dumps({
 """
 
 
-class PullRequestMemoryExtractor(MemoryExtractor):
+def _user_reply_from_message(message: str) -> str:
+    marker = "User reply:"
+    if marker not in message:
+        return ""
+    return message.split(marker, 1)[1].strip()
+
+
+def _preference_memories(user_reply: str) -> list[MemoryCandidate]:
+    memories: list[MemoryCandidate] = []
+    for raw_line in user_reply.splitlines():
+        line = raw_line.strip(" -\t")
+        if not line:
+            continue
+        lowered = line.lower()
+        if not any(marker in lowered for marker in PREFERENCE_MARKERS):
+            continue
+        memories.append(
+            MemoryCandidate(
+                text=f"For GitHub PR reviews, user preference: {line}",
+                scope=MemoryScope.AGENT,
+                metadata={"source": "user_review_preference"},
+            )
+        )
+    if memories:
+        return memories
+    lowered_reply = user_reply.lower()
+    if any(marker in lowered_reply for marker in PREFERENCE_MARKERS):
+        return [
+            MemoryCandidate(
+                text=f"For GitHub PR reviews, user preference: {user_reply.strip()}",
+                scope=MemoryScope.AGENT,
+                metadata={"source": "user_review_preference"},
+            )
+        ]
+    return []
+
+
+class ReviewPreferenceMemoryExtractor(MemoryExtractor):
     async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
-        candidates: list[MemoryCandidate] = []
-        for output in exchange.tool_outputs:
-            if output.get("name") != "github.pr_context":
-                continue
-            pr_context = output.get("output")
-            if not isinstance(pr_context, dict):
-                continue
-            repo = pr_context.get("repo")
-            changed_files = pr_context.get("changed_files")
-            changed_files_total = pr_context.get("changed_files_total")
-            check_runs = pr_context.get("check_runs")
-            if not isinstance(repo, str):
-                continue
-            changed_count = (
-                changed_files_total
-                if isinstance(changed_files_total, int)
-                else len(changed_files)
-                if isinstance(changed_files, list)
-                else 0
-            )
-            failed_checks = [
-                str(check.get("name"))
-                for check in check_runs or []
-                if isinstance(check, dict) and check.get("conclusion") not in {None, "success"}
-            ]
-            detail = f"Recent PR reviews for {repo} should consider {changed_count} changed files"
-            if failed_checks:
-                detail += f" and failed checks: {', '.join(failed_checks[:5])}"
-            candidates.append(
-                MemoryCandidate(
-                    text=detail,
-                    scope=MemoryScope.AGENT,
-                    importance=0.7,
-                    metadata={"source": "github_pr_context"},
-                )
-            )
-        if candidates:
-            return candidates
-        if "release-readiness" in exchange.assistant_message.lower():
-            return [
-                MemoryCandidate(
-                    text="Future PR reviews should include a release-readiness recommendation.",
-                    scope=MemoryScope.AGENT,
-                    importance=0.6,
-                    metadata={"source": "assistant_review"},
-                )
-            ]
+        user_reply = _user_reply_from_message(exchange.user_message)
+        if user_reply:
+            return _preference_memories(user_reply)
+        _ = exchange
         return []
 
 
 async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
     repo = str(arguments["repo"])
     pr_number = int(arguments["pr_number"])
-    token = secrets["github_token"]
+    token = await github_app_installation_token(secrets)
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -197,13 +205,46 @@ async def github_pr_comment(arguments: dict[str, Any], secrets: dict[str, str]) 
     repo = str(arguments["repo"])
     pr_number = int(arguments["pr_number"])
     body = str(arguments["body"])
+    token = await github_app_installation_token(secrets)
     url = await post_pr_comment(
         repo=repo,
         pr_number=pr_number,
-        token=secrets["github_token"],
+        token=token,
         review=body,
     )
     return {"url": url}
+
+
+async def github_app_installation_token(secrets: dict[str, str]) -> str:
+    app_id = os.environ["HARNESS_GITHUB_APP_ID"]
+    installation_id = os.environ["HARNESS_GITHUB_INSTALLATION_ID"]
+    private_key = _normalize_private_key(secrets["github_app_private_key"])
+    now = int(time.time())
+    app_jwt = jwt.encode(
+        {
+            "iat": now - 60,
+            "exp": now + 540,
+            "iss": app_id,
+        },
+        private_key,
+        algorithm="RS256",
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {app_jwt}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+            headers=headers,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("GitHub App installation token response did not include a token.")
+    return token
 
 
 async def _get_paginated_list(
@@ -243,7 +284,7 @@ def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
             description="Fetch real GitHub pull request metadata, changed files, and check runs.",
             execution_mode=ExecutionMode.IN_PROCESS,
             required_capabilities=["github:pr"],
-            required_secrets=["github_token"],
+            required_secrets=["github_app_private_key"],
             input_schema={
                 "type": "object",
                 "required": ["repo", "pr_number"],
@@ -289,7 +330,7 @@ def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
                 description="Post the final review as a GitHub pull request comment.",
                 execution_mode=ExecutionMode.IN_PROCESS,
                 required_capabilities=["github:comment"],
-                required_secrets=["github_token"],
+                required_secrets=["github_app_private_key"],
                 input_schema={
                     "type": "object",
                     "required": ["repo", "pr_number", "body"],
@@ -361,6 +402,8 @@ async def main() -> None:
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
     comment_enabled = _comment_enabled()
+    user_reply = os.environ.get("HARNESS_REVIEW_REPLY", "").strip()
+    requested_session_id = os.environ.get("HARNESS_SESSION_ID", "").strip()
     tool_capabilities = ["github:pr", "repo:sandbox"]
     if comment_enabled:
         tool_capabilities.append("github:comment")
@@ -429,21 +472,19 @@ async def main() -> None:
             raise RuntimeError("This example requires a real model provider.")
         model = runtime.model
         assert runtime.memory is not None
-        runtime.memory.extractor = PullRequestMemoryExtractor()
+        runtime.memory.extractor = ReviewPreferenceMemoryExtractor()
 
-        session = Session(
-            metadata={
-                "example": "github_pr_review_agent",
-                "repo": repo,
-                "pr": pr_number,
-                "repo_path": str(repo_path),
-            }
+        session = await _load_or_create_session(
+            storage,
+            session_id=requested_session_id or None,
+            repo=repo,
+            pr_number=pr_number,
+            repo_path=repo_path,
         )
-        await storage.create_session(session)
 
         loop = runtime.agent_loop(
             max_iterations=12,
-            stop_after_tools={"github.pr_comment"} if comment_enabled else None,
+            stop_after_tools={"github.pr_comment"} if comment_enabled and not user_reply else None,
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
@@ -458,7 +499,7 @@ async def main() -> None:
         )
         result = await loop.run(
             session.id,
-            _review_prompt(
+            _reply_prompt(user_reply) if user_reply else _review_prompt(
                 repo=repo,
                 pr_number=pr_number,
                 repo_path=repo_path,
@@ -471,7 +512,7 @@ async def main() -> None:
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
         comment_url = _comment_url_from_results(result.tool_results)
-        if comment_enabled and comment_url is None:
+        if comment_enabled and not user_reply and comment_url is None:
             raise RuntimeError("Review finished without posting a PR comment.")
 
         print(
@@ -487,6 +528,7 @@ async def main() -> None:
                     "tool_statuses": {call.tool_name: call.status for call in tool_calls},
                     "memory_ids_injected": result.memory_ids,
                     "comment_url": comment_url,
+                    "reply_processed": bool(user_reply),
                     "counts": {
                         "turns": len(turns),
                         "tool_calls": len(tool_calls),
@@ -523,6 +565,31 @@ async def post_pr_comment(*, repo: str, pr_number: int, token: str, review: str)
     payload = response.json()
     url = payload.get("html_url")
     return str(url) if isinstance(url, str) else ""
+
+
+async def _load_or_create_session(
+    storage: SQLiteStorage,
+    *,
+    session_id: str | None,
+    repo: str,
+    pr_number: int,
+    repo_path: Path,
+) -> Session:
+    metadata = {
+        "example": "github_pr_review_agent",
+        "repo": repo,
+        "pr": pr_number,
+        "repo_path": str(repo_path),
+    }
+    if session_id:
+        existing = await storage.get_session(session_id)
+        if existing is not None:
+            return existing
+        session = Session(id=session_id, metadata=metadata)
+    else:
+        session = Session(metadata=metadata)
+    await storage.create_session(session)
+    return session
 
 
 def _comment_body(review: str) -> str:
@@ -600,6 +667,21 @@ def _review_prompt(
     )
 
 
+def _reply_prompt(user_reply: str) -> str:
+    return (
+        "You are continuing a GitHub PR review conversation. Use relevant stored memory "
+        "from prior runs. Treat the user reply below as feedback on review style or "
+        "follow-up instructions. If it expresses durable review preferences, remember "
+        "them for future PR reviews. Return a concise response explaining how future "
+        "reviews should adapt.\n\n"
+        f"User reply:\n{user_reply}"
+    )
+
+
+def _normalize_private_key(value: str) -> str:
+    return value.replace("\\n", "\n").strip()
+
+
 async def _preflight(
     settings: HarnessSettings,
     *,
@@ -623,8 +705,12 @@ async def _preflight(
         raise RuntimeError("Set HARNESS_GITHUB_PR to a real pull request number.")
     if not repo_path.is_dir():
         raise RuntimeError(f"HARNESS_REPO_PATH must point to a local checkout: {repo_path}")
-    if not os.environ.get("HARNESS_SECRET_GITHUB_TOKEN"):
-        raise RuntimeError("Set HARNESS_SECRET_GITHUB_TOKEN to a real GitHub token.")
+    if not os.environ.get("HARNESS_GITHUB_APP_ID"):
+        raise RuntimeError("Set HARNESS_GITHUB_APP_ID to the GitHub App id.")
+    if not os.environ.get("HARNESS_GITHUB_INSTALLATION_ID"):
+        raise RuntimeError("Set HARNESS_GITHUB_INSTALLATION_ID to the App installation id.")
+    if not os.environ.get("HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"):
+        raise RuntimeError("Set HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY to the App private key.")
     docker = await anyio.run_process([settings.docker_bin, "info"], check=False)
     if docker.returncode != 0:
         raise RuntimeError(

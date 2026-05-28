@@ -48,7 +48,6 @@ class StaticMemoryExtractor(MemoryExtractor):
             MemoryCandidate(
                 text=f"remembered {exchange.user_message}",
                 scope=MemoryScope.SESSION,
-                importance=0.7,
             )
         ]
 
@@ -132,7 +131,6 @@ async def test_memory_manager_builds_context_with_structured_filters(tmp_path):
     await manager.remember(
         "alpha agent preference",
         scope=MemoryScope.AGENT,
-        importance=0.9,
     )
     await manager.remember(
         "alpha session scratch",

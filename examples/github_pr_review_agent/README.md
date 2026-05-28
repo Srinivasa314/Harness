@@ -6,7 +6,7 @@ main runtime features together:
 - OpenAI or Codex model provider.
 - MiniLM or OpenAI embeddings and scoped memory.
 - Capability-gated tools.
-- Environment-backed GitHub credential resolution.
+- Environment-backed GitHub App credential resolution.
 - Agent-directed Docker bash execution.
 - Context compaction.
 - SQLite observability records and dashboard inspection.
@@ -17,8 +17,18 @@ Required settings:
 export HARNESS_GITHUB_REPO=owner/repository
 export HARNESS_GITHUB_PR=123
 export HARNESS_REPO_PATH=/path/to/local/checkout
-export HARNESS_SECRET_GITHUB_TOKEN=...
+export HARNESS_GITHUB_APP_ID=12345
+export HARNESS_GITHUB_INSTALLATION_ID=67890
+export HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY='-----BEGIN RSA PRIVATE KEY-----...'
 ```
+
+The GitHub App must be installed on the target repository and needs pull-request
+read access, contents read access, checks read access, and issues write access
+to post review comments. The example mints an installation token from the App
+private key for every GitHub tool call. Personal access tokens are not supported
+by this example, so PR comments are clearly authored by the installed App.
+If the private key is stored on one line, encode newlines as `\n`; the example
+normalizes them before signing the App JWT.
 
 Set `HARNESS_OPENAI_API_KEY` when using OpenAI for inference or embeddings.
 
@@ -46,6 +56,18 @@ The example requires Docker for the sandboxed project-check tool.
 It keeps its SQLite database by default so memories can carry across runs. Set
 `HARNESS_EXAMPLE_RESET_DB=1` to start from a clean database.
 
+To continue an existing review conversation and teach review preferences, pass
+the previous `session_id` and a reply:
+
+```bash
+export HARNESS_SESSION_ID=...
+export HARNESS_REVIEW_REPLY='Prefer stricter comments on missing tests. Always include migration risk.'
+uv run python examples/github_pr_review_agent/agent.py
+```
+
+Durable preference memories are stored at agent scope and retrieved for later PR
+reviews in the same memory namespace.
+
 To post the review as a PR comment:
 
 ```bash
@@ -55,7 +77,5 @@ export HARNESS_GITHUB_COMMENT=1
 When enabled, commenting is done by the agent through the `github.pr_comment`
 tool after it has run `github.pr_context` and explored the checkout with
 `repo.bash`.
-GitHub shows the comment author based on the token used. A personal token posts
-as that user; use a GitHub App or machine-user token if the comment should have
-a dedicated bot identity. The comment body is marked as coming from the Harness
-PR review agent.
+GitHub shows the comment author as the installed GitHub App. The comment body is
+also marked as coming from the Harness PR review agent.

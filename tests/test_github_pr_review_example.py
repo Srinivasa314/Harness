@@ -73,6 +73,54 @@ def test_github_pr_example_comment_tool_is_optional() -> None:
     assert "github.pr_comment" not in without_comment_names
     assert "github.pr_comment" in with_comment_names
     assert "repo.bash" in with_comment_names
+    definitions = {definition.name: definition for definition in with_comment.list_definitions()}
+    pr_context = definitions["github.pr_context"]
+    pr_comment = definitions["github.pr_comment"]
+    assert pr_context.required_secrets == ["github_app_private_key"]
+    assert pr_comment.required_secrets == ["github_app_private_key"]
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_extracts_user_review_preferences() -> None:
+    module = _load_example_module()
+    extractor = module.ReviewPreferenceMemoryExtractor()
+
+    memories = await extractor.extract(
+        module.MemoryExchange(
+            session_id="session-1",
+            user_message=(
+                "You are continuing a GitHub PR review conversation.\n\n"
+                "User reply:\n"
+                "- Prefer stricter comments on missing tests.\n"
+                "- Always include migration risk."
+            ),
+            assistant_message="noted",
+        )
+    )
+
+    assert [memory.metadata for memory in memories] == [
+        {"source": "user_review_preference"},
+        {"source": "user_review_preference"},
+    ]
+    assert memories[0].scope == module.MemoryScope.AGENT
+    assert "Prefer stricter comments" in memories[0].text
+    assert "Always include migration risk" in memories[1].text
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_ignores_non_preference_replies() -> None:
+    module = _load_example_module()
+    extractor = module.ReviewPreferenceMemoryExtractor()
+
+    memories = await extractor.extract(
+        module.MemoryExchange(
+            session_id="session-1",
+            user_message="User reply:\nThanks for the review.",
+            assistant_message="noted",
+        )
+    )
+
+    assert memories == []
 
 
 @pytest.mark.anyio
@@ -192,6 +240,81 @@ async def test_github_pr_example_posts_agent_comment(monkeypatch: pytest.MonkeyP
     assert isinstance(captured["payload"], dict)
     assert "Harness PR Review Agent" in str(captured["payload"]["body"])
     assert "Release-ready." in str(captured["payload"]["body"])
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_mints_github_app_installation_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_example_module()
+    captured: dict[str, Any] = {}
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["authorization"] = request.headers.get("Authorization")
+        return httpx.Response(201, json={"token": "installation-token"})
+
+    monkeypatch.setenv("HARNESS_GITHUB_APP_ID", "12345")
+    monkeypatch.setenv("HARNESS_GITHUB_INSTALLATION_ID", "67890")
+    monkeypatch.setattr(module, "GITHUB_API", "https://api.github.test")
+    monkeypatch.setattr(module.jwt, "encode", lambda *args, **kwargs: "app-jwt")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: client)
+
+    try:
+        token = await module.github_app_installation_token(
+            {"github_app_private_key": "line1\\nline2"}
+        )
+    finally:
+        await client.aclose()
+
+    assert token == "installation-token"
+    assert captured["url"] == "https://api.github.test/app/installations/67890/access_tokens"
+    assert captured["authorization"] == "Bearer app-jwt"
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_comment_tool_uses_github_app_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_example_module()
+    captured: dict[str, Any] = {}
+
+    async def fake_installation_token(secrets: dict[str, str]) -> str:
+        captured["secrets"] = secrets
+        return "installation-token"
+
+    async def fake_post_pr_comment(
+        *,
+        repo: str,
+        pr_number: int,
+        token: str,
+        review: str,
+    ) -> str:
+        captured["comment"] = {
+            "repo": repo,
+            "pr_number": pr_number,
+            "token": token,
+            "review": review,
+        }
+        return "https://github.test/comment"
+
+    monkeypatch.setattr(module, "github_app_installation_token", fake_installation_token)
+    monkeypatch.setattr(module, "post_pr_comment", fake_post_pr_comment)
+
+    result = await module.github_pr_comment(
+        {"repo": "owner/repo", "pr_number": 7, "body": "Ready."},
+        {"github_app_private_key": "private-key"},
+    )
+
+    assert result == {"url": "https://github.test/comment"}
+    assert captured["secrets"] == {"github_app_private_key": "private-key"}
+    assert captured["comment"] == {
+        "repo": "owner/repo",
+        "pr_number": 7,
+        "token": "installation-token",
+        "review": "Ready.",
+    }
 
 
 def _load_example_module() -> ModuleType:

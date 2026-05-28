@@ -148,7 +148,6 @@ class MemoryRecord(BaseModel):
     embedding_dimensions: int | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     scope: MemoryScope = MemoryScope.AGENT
-    importance: float = Field(default=0.5, ge=0.0, le=1.0)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     source_session_id: str | None = None
     source_turn_id: str | None = None

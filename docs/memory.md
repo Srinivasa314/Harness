@@ -49,7 +49,7 @@ Stored memories include:
 - redacted text;
 - metadata;
 - scope and namespace;
-- importance and confidence;
+- confidence;
 - source references;
 - timestamps;
 - vector data.
@@ -67,6 +67,13 @@ write memories explicitly through `MemoryStore` or the manager.
 Use explicit writes when the application already knows what should become
 memory. Use auto-capture when the agent transcript is the source of truth and
 occasional summarization calls are acceptable.
+
+Good durable memories are usually stable user preferences, project conventions,
+or facts that should influence future sessions. Avoid storing noisy run facts
+that are only useful for the current task, such as a specific PR's changed-file
+count. The GitHub PR review example uses auto-capture for user review
+preferences expressed in replies, then retrieves those preferences for later PR
+reviews in the same namespace.
 
 ## Compaction
 
