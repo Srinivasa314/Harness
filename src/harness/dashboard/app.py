@@ -54,11 +54,6 @@ def build_app(db_path: str | Path | None = None) -> None:
                 value=active_session_id,
                 label="Session",
             ).props("dense outlined").classes("min-w-[24rem]")
-            tool_status = ui.select(
-                ["", "ok", "error", "denied", "timeout"],
-                value="",
-                label="Tool status",
-            ).props("dense outlined").classes("min-w-[12rem]")
 
         with ui.row().classes("w-full gap-3"):
             for card in summary_cards(
@@ -132,6 +127,11 @@ def build_app(db_path: str | Path | None = None) -> None:
                     row_key="id",
                 ).classes("w-full")
             with ui.tab_panel(tools_tab):
+                tool_status = ui.select(
+                    ["", "ok", "error", "denied", "timeout"],
+                    value="",
+                    label="Tool status",
+                ).props("dense outlined").classes("min-w-[12rem]")
                 tools_table = ui.table(
                     columns=[
                         {"name": "started_at", "label": "Started", "field": "started_at"},
