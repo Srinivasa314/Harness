@@ -22,7 +22,7 @@ from harness.execution import (
     DockerContainerExecutor,
     InProcessExecutor,
 )
-from harness.memory import MemoryCandidate, MemoryExchange, MemoryExtractor
+from harness.memory import MemoryManager
 from harness.runtime import build_runtime_async
 from harness.schemas import (
     ContainerSchema,
@@ -46,20 +46,6 @@ MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
 TRUSTED_REPLY_ASSOCIATIONS = {"OWNER"}
 DEFAULT_APP_SLUG = "harness-pr-review-agent"
-PREFERENCE_MARKERS = (
-    "always",
-    "avoid",
-    "don't",
-    "do not",
-    "focus",
-    "include",
-    "never",
-    "need not",
-    "no need",
-    "prefer",
-    "prioritize",
-    "skip",
-)
 
 
 class PullRequestReply(NamedTuple):
@@ -109,100 +95,6 @@ print(json.dumps({
     "stderr": completed.stderr[-12000:],
 }))
 """
-
-
-def _user_replies_from_message(message: str) -> list[PullRequestReply]:
-    marker = "GitHub user replies:"
-    if marker not in message:
-        return []
-    replies: list[PullRequestReply] = []
-    current_id: int | None = None
-    current_author = ""
-    current_body: list[str] = []
-    for raw_line in message.split(marker, 1)[1].splitlines():
-        line = raw_line.strip()
-        if line.startswith("Comment ") and " by " in line and line.endswith(":"):
-            if current_id is not None:
-                replies.append(
-                    PullRequestReply(
-                        comment_id=current_id,
-                        author=current_author,
-                        body="\n".join(current_body).strip(),
-                    )
-                )
-            header = line.removesuffix(":")
-            comment_part, author = header.split(" by ", 1)
-            try:
-                current_id = int(comment_part.removeprefix("Comment ").strip())
-            except ValueError:
-                current_id = None
-            current_author = author.strip()
-            current_body = []
-            continue
-        if current_id is not None:
-            current_body.append(raw_line)
-    if current_id is not None:
-        replies.append(
-            PullRequestReply(
-                comment_id=current_id,
-                author=current_author,
-                body="\n".join(current_body).strip(),
-            )
-        )
-    return [reply for reply in replies if reply.body]
-
-
-def _preference_memories(reply: PullRequestReply) -> list[MemoryCandidate]:
-    memories: list[MemoryCandidate] = []
-    for raw_line in reply.body.splitlines():
-        line = raw_line.strip(" -\t")
-        if not line:
-            continue
-        lowered = line.lower()
-        if not any(marker in lowered for marker in PREFERENCE_MARKERS):
-            continue
-        memories.append(
-            MemoryCandidate(
-                text=f"For GitHub PR reviews, user preference: {line}",
-                scope=MemoryScope.AGENT,
-                metadata={
-                    "source": "github_pr_comment",
-                    "github_comment_id": reply.comment_id,
-                    "github_comment_author": reply.author,
-                },
-            )
-        )
-    if memories:
-        return memories
-    lowered_reply = reply.body.lower()
-    if any(marker in lowered_reply for marker in PREFERENCE_MARKERS):
-        return [
-            MemoryCandidate(
-                text=f"For GitHub PR reviews, user preference: {reply.body.strip()}",
-                scope=MemoryScope.AGENT,
-                metadata={
-                    "source": "github_pr_comment",
-                    "github_comment_id": reply.comment_id,
-                    "github_comment_author": reply.author,
-                },
-            )
-        ]
-    return []
-
-
-class ReviewPreferenceMemoryExtractor(MemoryExtractor):
-    async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
-        replies = _replies_from_tool_outputs(exchange.tool_outputs)
-        if not replies:
-            replies = _user_replies_from_message(exchange.user_message)
-        if replies:
-            return [
-                memory
-                for reply in replies
-                for memory in _preference_memories(reply)
-            ]
-        _ = exchange
-        return []
 
 
 def _replies_from_tool_outputs(tool_outputs: list[dict[str, Any]]) -> list[PullRequestReply]:
@@ -573,6 +465,8 @@ def register_run_tools(
     registry: ToolRegistry,
     *,
     storage: SQLiteStorage,
+    memory: MemoryManager,
+    session_id: str,
 ) -> None:
     async def github_pr_replies(
         arguments: dict[str, Any],
@@ -590,6 +484,28 @@ def register_run_tools(
             app_slug=app_slug,
         )
         return {"replies": [_reply_payload(reply) for reply in replies]}
+
+    async def memory_remember_preference(
+        arguments: dict[str, Any],
+        secrets: dict[str, str],
+    ) -> dict[str, str]:
+        _ = secrets
+        comment_id = int(arguments["comment_id"])
+        author = str(arguments["author"])
+        preference = str(arguments["preference"]).strip()
+        if not preference:
+            raise ValueError("preference must not be empty")
+        record = await memory.remember(
+            f"For GitHub PR reviews, user preference: {preference}",
+            scope=MemoryScope.AGENT,
+            metadata={
+                "source": "github_pr_comment",
+                "github_comment_id": comment_id,
+                "github_comment_author": author,
+            },
+            source_session_id=session_id,
+        )
+        return {"memory_id": record.id}
 
     registry.register(
         ToolDefinition(
@@ -634,6 +550,39 @@ def register_run_tools(
         ),
         github_pr_replies,
     )
+    registry.register(
+        ToolDefinition(
+            name="memory.remember_preference",
+            description=(
+                "Store a durable GitHub PR review preference from a directly addressed "
+                "owner reply. Use this only for reusable standing guidance, review style "
+                "preferences, or project review policy; do not store thanks, one-off PR "
+                "facts, or current-run findings."
+            ),
+            execution_mode=ExecutionMode.IN_PROCESS,
+            required_capabilities=["memory:write"],
+            input_schema={
+                "type": "object",
+                "required": ["comment_id", "author", "preference"],
+                "properties": {
+                    "comment_id": {"type": "integer"},
+                    "author": {"type": "string"},
+                    "preference": {
+                        "type": "string",
+                        "description": "Concise durable guidance for future PR reviews.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "required": ["memory_id"],
+                "properties": {"memory_id": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        memory_remember_preference,
+    )
 
 
 async def main() -> None:
@@ -645,7 +594,13 @@ async def main() -> None:
     repo = os.environ.get("HARNESS_GITHUB_REPO", "")
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
-    tool_capabilities = ["github:pr", "github:replies", "github:comment", "repo:sandbox"]
+    tool_capabilities = [
+        "github:pr",
+        "github:replies",
+        "github:comment",
+        "memory:write",
+        "repo:sandbox",
+    ]
     context_max_chars = int(os.environ.get("HARNESS_PR_REVIEW_CONTEXT_MAX_CHARS", "120000"))
     context_trigger_ratio = float(
         os.environ.get("HARNESS_PR_REVIEW_COMPACTION_TRIGGER_RATIO", "0.75")
@@ -658,7 +613,7 @@ async def main() -> None:
         embedding_provider=os.environ.get("HARNESS_EMBEDDING_PROVIDER", "minilm"),
         memory_enabled=True,
         memory_namespace="github-pr-review-demo",
-        memory_auto_capture=True,
+        memory_auto_capture=False,
         memory_retrieval_limit=4,
         memory_max_context_chars=1_500,
         context_compaction_enabled=True,
@@ -722,7 +677,6 @@ async def main() -> None:
             raise RuntimeError("This example requires a real model provider.")
         model = runtime.model
         assert runtime.memory is not None
-        runtime.memory.extractor = ReviewPreferenceMemoryExtractor()
 
         session = Session(
             metadata={
@@ -734,7 +688,12 @@ async def main() -> None:
             }
         )
         await storage.create_session(session)
-        register_run_tools(registry, storage=storage)
+        register_run_tools(
+            registry,
+            storage=storage,
+            memory=runtime.memory,
+            session_id=session.id,
+        )
 
         loop = runtime.agent_loop(
             max_iterations=int(os.environ.get("HARNESS_PR_REVIEW_MAX_ITERATIONS", "32")),
@@ -932,10 +891,13 @@ def _review_prompt(
         "Relevant review preferences may already appear in the context above. Treat "
         "them as standing instructions when they apply to this PR.\n\n"
         "Start by calling github.pr_replies. If it returns user replies, handle those "
-        "replies before doing anything else. Treat preference-like replies as standing "
-        "review guidance for future runs. Do not perform a fresh code review unless a "
-        "reply explicitly asks for one; otherwise return a concise final answer "
-        "summarizing what was processed.\n\n"
+        "replies before doing anything else. Decide whether each reply contains "
+        "durable review guidance for future runs. For each durable preference, call "
+        "memory.remember_preference with a concise normalized preference and the reply "
+        "comment metadata. Ignore thanks, one-off PR facts, current-run findings, and "
+        "requests that are only about the current run. Do not perform a fresh code "
+        "review unless a reply explicitly asks for one; otherwise return a concise "
+        "final answer summarizing what was processed and any memory written.\n\n"
         "For a fresh review, call github.pr_context to fetch PR metadata, changed "
         "files, and checks. Then inspect the local checkout with repo.bash. Use as "
         "many repo.bash calls as needed to understand the project structure, changed "

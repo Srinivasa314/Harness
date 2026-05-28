@@ -12,6 +12,8 @@ import aiosqlite
 import httpx
 import pytest
 
+from harness.memory import HashEmbeddingProvider, MemoryManager, MemoryPolicy, MemoryStore
+
 
 def test_github_pr_example_bash_runner_explores_generic_repo(tmp_path: Path) -> None:
     module = _load_example_module()
@@ -125,132 +127,69 @@ def test_github_pr_example_registers_run_scoped_tools(tmp_path: Path) -> None:
     module = _load_example_module()
     registry = module.build_registry()
     storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
+    memory = MemoryManager(
+        MemoryStore(storage, HashEmbeddingProvider()),
+        MemoryPolicy(namespace="github-pr-review-demo", auto_capture=False),
+    )
 
-    module.register_run_tools(registry, storage=storage)
+    module.register_run_tools(registry, storage=storage, memory=memory, session_id="session-1")
     definitions = {definition.name: definition for definition in registry.list_definitions()}
 
     assert definitions["github.pr_replies"].required_capabilities == ["github:replies"]
     assert definitions["github.pr_replies"].required_secrets == ["github_app_private_key"]
+    assert definitions["memory.remember_preference"].required_capabilities == ["memory:write"]
     assert "memory.search" not in definitions
 
 
 @pytest.mark.anyio
-async def test_github_pr_example_extracts_user_review_preferences() -> None:
+async def test_github_pr_example_memory_tool_stores_user_review_preferences(
+    tmp_path: Path,
+) -> None:
     module = _load_example_module()
-    extractor = module.ReviewPreferenceMemoryExtractor()
-
-    memories = await extractor.extract(
-        module.MemoryExchange(
-            session_id="session-1",
-            user_message="review",
-            assistant_message="noted",
-            tool_outputs=[
-                {
-                    "name": "github.pr_replies",
-                    "output": {
-                        "replies": [
-                            {
-                                "comment_id": 101,
-                                "author": "alice",
-                                "body": (
-                                    "- Prefer stricter comments on missing tests.\n"
-                                    "- Always include migration risk."
-                                ),
-                            },
-                            {
-                                "comment_id": 102,
-                                "author": "bob",
-                                "body": (
-                                    "@review-app You need not run tests as the CI "
-                                    "would do it."
-                                ),
-                            },
-                        ]
-                    },
-                }
-            ],
-        )
+    storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
+    await storage.migrate()
+    memory = MemoryManager(
+        MemoryStore(storage, HashEmbeddingProvider()),
+        MemoryPolicy(namespace="github-pr-review-demo", auto_capture=False),
     )
+    registry = module.build_registry()
+    module.register_run_tools(registry, storage=storage, memory=memory, session_id="session-1")
 
-    assert [memory.metadata for memory in memories] == [
+    result = await registry.function_for("memory.remember_preference")(
         {
-            "source": "github_pr_comment",
-            "github_comment_id": 101,
-            "github_comment_author": "alice",
+            "comment_id": 102,
+            "author": "bob",
+            "preference": "Analyze code read-only and do not run tests because CI handles them.",
         },
-        {
-            "source": "github_pr_comment",
-            "github_comment_id": 101,
-            "github_comment_author": "alice",
-        },
-        {
-            "source": "github_pr_comment",
-            "github_comment_id": 102,
-            "github_comment_author": "bob",
-        },
-    ]
+        {},
+    )
+    memories = await storage.list_memories("github-pr-review-demo")
+
+    assert isinstance(result, dict)
+    assert result["memory_id"] == memories[0].id
     assert memories[0].scope == module.MemoryScope.AGENT
-    assert "Prefer stricter comments" in memories[0].text
-    assert "Always include migration risk" in memories[1].text
-    assert "need not run tests" in memories[2].text
-    assert memories[0].metadata["github_comment_id"] == 101
-    assert memories[0].metadata["github_comment_author"] == "alice"
+    assert (
+        memories[0].text
+        == "For GitHub PR reviews, user preference: Analyze code read-only and "
+        "do not run tests because CI handles them."
+    )
+    assert memories[0].metadata == {
+        "source": "github_pr_comment",
+        "github_comment_id": 102,
+        "github_comment_author": "bob",
+    }
+    assert memories[0].source_session_id == "session-1"
 
 
 @pytest.mark.anyio
-async def test_github_pr_example_ignores_non_preference_replies() -> None:
+async def test_github_pr_example_does_not_auto_store_pr_context_as_memory(
+    tmp_path: Path,
+) -> None:
     module = _load_example_module()
-    extractor = module.ReviewPreferenceMemoryExtractor()
+    storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
+    await storage.migrate()
 
-    memories = await extractor.extract(
-        module.MemoryExchange(
-            session_id="session-1",
-            user_message="review",
-            assistant_message="noted",
-            tool_outputs=[
-                {
-                    "name": "github.pr_replies",
-                    "output": {
-                        "replies": [
-                            {
-                                "comment_id": 101,
-                                "author": "alice",
-                                "body": "Thanks for the review.",
-                            }
-                        ]
-                    },
-                }
-            ],
-        )
-    )
-
-    assert memories == []
-
-
-@pytest.mark.anyio
-async def test_github_pr_example_does_not_store_pr_context_as_memory() -> None:
-    module = _load_example_module()
-    extractor = module.ReviewPreferenceMemoryExtractor()
-
-    memories = await extractor.extract(
-        module.MemoryExchange(
-            session_id="session-1",
-            user_message="review",
-            assistant_message="Reviewed 12 changed files and failing checks.",
-            tool_outputs=[
-                {
-                    "name": "github.pr_context",
-                    "output": {
-                        "changed_files_total": 12,
-                        "check_runs": [
-                            {"name": "provider-e2e", "conclusion": "failure"},
-                        ],
-                    },
-                }
-            ],
-        )
-    )
-
+    memories = await storage.list_memories("github-pr-review-demo")
     assert memories == []
 
 
