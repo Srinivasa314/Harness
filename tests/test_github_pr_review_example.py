@@ -160,7 +160,10 @@ async def test_github_pr_example_extracts_user_review_preferences() -> None:
                             {
                                 "comment_id": 102,
                                 "author": "bob",
-                                "body": "Thanks for the review.",
+                                "body": (
+                                    "@review-app You need not run tests as the CI "
+                                    "would do it."
+                                ),
                             },
                         ]
                     },
@@ -180,10 +183,16 @@ async def test_github_pr_example_extracts_user_review_preferences() -> None:
             "github_comment_id": 101,
             "github_comment_author": "alice",
         },
+        {
+            "source": "github_pr_comment",
+            "github_comment_id": 102,
+            "github_comment_author": "bob",
+        },
     ]
     assert memories[0].scope == module.MemoryScope.AGENT
     assert "Prefer stricter comments" in memories[0].text
     assert "Always include migration risk" in memories[1].text
+    assert "need not run tests" in memories[2].text
     assert memories[0].metadata["github_comment_id"] == 101
     assert memories[0].metadata["github_comment_author"] == "alice"
 

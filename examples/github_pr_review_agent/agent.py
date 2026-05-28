@@ -54,6 +54,8 @@ PREFERENCE_MARKERS = (
     "focus",
     "include",
     "never",
+    "need not",
+    "no need",
     "prefer",
     "prioritize",
     "skip",
