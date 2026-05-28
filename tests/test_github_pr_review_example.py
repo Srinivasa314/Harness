@@ -81,6 +81,30 @@ def test_github_pr_example_comment_tool_is_optional() -> None:
     assert pr_comment.required_secrets == ["github_app_private_key"]
 
 
+def test_github_pr_example_registers_run_scoped_tools(tmp_path: Path) -> None:
+    module = _load_example_module()
+    registry = module.build_registry(enable_comment_tool=False)
+    storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
+
+    class FakeMemory:
+        async def context_for(self, query: str, *, session_id: str):
+            assert query == "preferences"
+            assert session_id == "session-1"
+            return type("Context", (), {"content": "", "memories": []})()
+
+    module.register_run_tools(
+        registry,
+        storage=storage,
+        memory=FakeMemory(),
+        session_id="session-1",
+    )
+    definitions = {definition.name: definition for definition in registry.list_definitions()}
+
+    assert definitions["github.pr_replies"].required_capabilities == ["github:replies"]
+    assert definitions["github.pr_replies"].required_secrets == ["github_app_private_key"]
+    assert definitions["memory.search"].required_capabilities == ["memory:search"]
+
+
 @pytest.mark.anyio
 async def test_github_pr_example_extracts_user_review_preferences() -> None:
     module = _load_example_module()
@@ -89,16 +113,30 @@ async def test_github_pr_example_extracts_user_review_preferences() -> None:
     memories = await extractor.extract(
         module.MemoryExchange(
             session_id="session-1",
-            user_message=(
-                "You are continuing a GitHub PR review conversation.\n\n"
-                "GitHub user replies:\n"
-                "Comment 101 by alice:\n"
-                "- Prefer stricter comments on missing tests.\n"
-                "- Always include migration risk.\n\n"
-                "Comment 102 by bob:\n"
-                "Thanks for the review."
-            ),
+            user_message="review",
             assistant_message="noted",
+            tool_outputs=[
+                {
+                    "name": "github.pr_replies",
+                    "output": {
+                        "replies": [
+                            {
+                                "comment_id": 101,
+                                "author": "alice",
+                                "body": (
+                                    "- Prefer stricter comments on missing tests.\n"
+                                    "- Always include migration risk."
+                                ),
+                            },
+                            {
+                                "comment_id": 102,
+                                "author": "bob",
+                                "body": "Thanks for the review.",
+                            },
+                        ]
+                    },
+                }
+            ],
         )
     )
 
@@ -129,8 +167,22 @@ async def test_github_pr_example_ignores_non_preference_replies() -> None:
     memories = await extractor.extract(
         module.MemoryExchange(
             session_id="session-1",
-            user_message="GitHub user replies:\nComment 101 by alice:\nThanks for the review.",
+            user_message="review",
             assistant_message="noted",
+            tool_outputs=[
+                {
+                    "name": "github.pr_replies",
+                    "output": {
+                        "replies": [
+                            {
+                                "comment_id": 101,
+                                "author": "alice",
+                                "body": "Thanks for the review.",
+                            }
+                        ]
+                    },
+                }
+            ],
         )
     )
 

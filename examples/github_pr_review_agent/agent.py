@@ -180,7 +180,9 @@ def _preference_memories(reply: PullRequestReply) -> list[MemoryCandidate]:
 
 class ReviewPreferenceMemoryExtractor(MemoryExtractor):
     async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
-        replies = _user_replies_from_message(exchange.user_message)
+        replies = _replies_from_tool_outputs(exchange.tool_outputs)
+        if not replies:
+            replies = _user_replies_from_message(exchange.user_message)
         if replies:
             return [
                 memory
@@ -189,6 +191,38 @@ class ReviewPreferenceMemoryExtractor(MemoryExtractor):
             ]
         _ = exchange
         return []
+
+
+def _replies_from_tool_outputs(tool_outputs: list[dict[str, Any]]) -> list[PullRequestReply]:
+    replies: list[PullRequestReply] = []
+    for output in tool_outputs:
+        if output.get("name") != "github.pr_replies":
+            continue
+        payload = output.get("output")
+        if not isinstance(payload, dict):
+            continue
+        raw_replies = payload.get("replies")
+        if not isinstance(raw_replies, list):
+            continue
+        for raw_reply in raw_replies:
+            if not isinstance(raw_reply, dict):
+                continue
+            comment_id = raw_reply.get("comment_id")
+            author = raw_reply.get("author")
+            body = raw_reply.get("body")
+            if isinstance(comment_id, int) and isinstance(author, str) and isinstance(body, str):
+                replies.append(PullRequestReply(comment_id, author, body))
+    return replies
+
+
+def _replies_from_tool_results(results: list[Any]) -> list[PullRequestReply]:
+    tool_outputs = [
+        result.model_dump(mode="json")
+        for result in results
+        if getattr(result, "name", None) == "github.pr_replies"
+        and getattr(result, "status", None) == "ok"
+    ]
+    return _replies_from_tool_outputs(tool_outputs)
 
 
 async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
@@ -341,6 +375,14 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
     return replies
 
 
+def _reply_payload(reply: PullRequestReply) -> dict[str, Any]:
+    return {
+        "comment_id": reply.comment_id,
+        "author": reply.author,
+        "body": reply.body,
+    }
+
+
 async def _get_paginated_list(
     client: httpx.AsyncClient,
     url: str,
@@ -486,6 +528,128 @@ def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
     return registry
 
 
+def register_run_tools(
+    registry: ToolRegistry,
+    *,
+    storage: SQLiteStorage,
+    memory: Any,
+    session_id: str,
+) -> None:
+    async def github_pr_replies(
+        arguments: dict[str, Any],
+        secrets: dict[str, str],
+    ) -> dict[str, Any]:
+        repo = str(arguments["repo"])
+        pr_number = int(arguments["pr_number"])
+        token = await github_app_installation_token(secrets)
+        replies = await _unprocessed_replies(
+            storage,
+            repo=repo,
+            pr_number=pr_number,
+            token=token,
+        )
+        return {"replies": [_reply_payload(reply) for reply in replies]}
+
+    async def memory_search(arguments: dict[str, Any], _secrets: dict[str, str]) -> dict[str, Any]:
+        query = str(arguments["query"])
+        context = await memory.context_for(query, session_id=session_id)
+        return {
+            "content": context.content,
+            "memories": [
+                {
+                    "id": item.memory.id,
+                    "scope": item.memory.scope.value,
+                    "text": item.memory.text,
+                    "score": item.score,
+                    "metadata": item.memory.metadata,
+                }
+                for item in context.memories
+            ],
+        }
+
+    registry.register(
+        ToolDefinition(
+            name="github.pr_replies",
+            description=(
+                "Read unprocessed user replies on the GitHub PR after the latest Harness "
+                "agent comment. Use this before deciding whether to process review "
+                "preferences or run a fresh review."
+            ),
+            execution_mode=ExecutionMode.IN_PROCESS,
+            required_capabilities=["github:replies"],
+            required_secrets=["github_app_private_key"],
+            input_schema={
+                "type": "object",
+                "required": ["repo", "pr_number"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "required": ["replies"],
+                "properties": {
+                    "replies": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["comment_id", "author", "body"],
+                            "properties": {
+                                "comment_id": {"type": "integer"},
+                                "author": {"type": "string"},
+                                "body": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "additionalProperties": False,
+            },
+        ),
+        github_pr_replies,
+    )
+    registry.register(
+        ToolDefinition(
+            name="memory.search",
+            description="Search durable memory for relevant review preferences and context.",
+            execution_mode=ExecutionMode.IN_PROCESS,
+            required_capabilities=["memory:search"],
+            input_schema={
+                "type": "object",
+                "required": ["query"],
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "required": ["content", "memories"],
+                "properties": {
+                    "content": {"type": "string"},
+                    "memories": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["id", "scope", "text", "score", "metadata"],
+                            "properties": {
+                                "id": {"type": "string"},
+                                "scope": {"type": "string"},
+                                "text": {"type": "string"},
+                                "score": {"type": "number"},
+                                "metadata": {"type": "object"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "additionalProperties": False,
+            },
+        ),
+        memory_search,
+    )
+
+
 async def main() -> None:
     _load_local_env_file(ROOT / ".env.development")
     os.environ.setdefault("HF_HOME", str(HF_CACHE))
@@ -496,7 +660,7 @@ async def main() -> None:
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
     comment_enabled = _comment_enabled()
-    tool_capabilities = ["github:pr", "repo:sandbox"]
+    tool_capabilities = ["github:pr", "github:replies", "memory:search", "repo:sandbox"]
     if comment_enabled:
         tool_capabilities.append("github:comment")
     settings = HarnessSettings(
@@ -575,22 +739,16 @@ async def main() -> None:
             }
         )
         await storage.create_session(session)
-        github_token = await github_app_installation_token(
-            {"github_app_private_key": os.environ["HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"]}
+        register_run_tools(
+            registry,
+            storage=storage,
+            memory=runtime.memory,
+            session_id=session.id,
         )
-        replies = await _unprocessed_replies(
-            storage,
-            repo=repo,
-            pr_number=pr_number,
-            token=github_token,
-        )
-        is_follow_up = bool(replies)
 
         loop = runtime.agent_loop(
-            max_iterations=12,
-            stop_after_tools=(
-                {"github.pr_comment"} if comment_enabled and not is_follow_up else None
-            ),
+            max_iterations=int(os.environ.get("HARNESS_PR_REVIEW_MAX_ITERATIONS", "32")),
+            stop_after_tools={"github.pr_comment"} if comment_enabled else None,
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
@@ -605,13 +763,14 @@ async def main() -> None:
         )
         result = await loop.run(
             session.id,
-            _reply_prompt(replies) if is_follow_up else _review_prompt(
+            _review_prompt(
                 repo=repo,
                 pr_number=pr_number,
                 repo_path=repo_path,
                 comment_enabled=comment_enabled,
             ),
         )
+        replies = _replies_from_tool_results(result.tool_results)
         await _mark_replies_processed(
             storage,
             repo=repo,
@@ -624,7 +783,7 @@ async def main() -> None:
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
         comment_url = _comment_url_from_results(result.tool_results)
-        if comment_enabled and not is_follow_up and comment_url is None:
+        if comment_enabled and not replies and comment_url is None:
             raise RuntimeError("Review finished without posting a PR comment.")
 
         print(
@@ -784,52 +943,42 @@ def _review_prompt(
         else "Do not post a PR comment in this run; return the review as the final answer."
     )
     return (
-        "You are a GitHub PR review agent. Produce a concise code review with concrete "
-        "findings, test gaps, and a release-readiness recommendation. Use the harness "
-        "JSON protocol, with no markdown outside the JSON.\n\n"
+        "You are a GitHub PR review agent. Use the harness JSON protocol, with no "
+        "markdown outside the JSON.\n\n"
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
         f"Local repository root: {repo_path}\n\n"
-        "Strict workflow: iteration 1 must call github.pr_context with the repo and PR "
-        "number. Iteration 2 must call repo.bash with a batch of two to four focused "
-        "commands of your choice. Iteration 3 must call github.pr_comment if commenting "
-        "is enabled, otherwise return the final review. Do not call github.pr_context "
-        "after iteration 1. The repo.bash tool runs inside Docker with no network and "
-        "read-only access to the local checkout at /repo. "
+        "First, call github.pr_replies and memory.search. Use github.pr_replies to check "
+        "for unprocessed user replies on the PR. Use memory.search to retrieve relevant "
+        "review preferences and prior context. If github.pr_replies returns replies, "
+        "treat them as follow-up feedback. If they contain durable review preferences, "
+        "they will be captured into memory after the run. In that case, do not run a "
+        "fresh code review unless the replies explicitly ask for one; return a brief "
+        "final answer summarizing what was processed.\n\n"
+        "If there are no unprocessed user replies, perform a fresh PR review. Call "
+        "github.pr_context to fetch PR metadata, changed files, and checks. Then use "
+        "repo.bash iteratively as needed to inspect the local checkout and judge code "
+        "quality. You are not limited to a fixed number of repo.bash calls; keep "
+        "exploring until you have enough evidence for a concrete review, then stop. "
+        "The repo.bash tool runs inside Docker with no network and read-only access to "
+        "the local checkout at /repo. "
         "A repo.bash tool call must be shaped exactly like "
         "{\"tool_calls\":[{\"name\":\"repo.bash\",\"arguments\":{\"command\":"
         "\"find . -maxdepth 2 \\( -path './.git' -o -path './.venv' -o "
         "-path './data' -o -name '.env*' -o -name '*cache*' \\) -prune -o "
         "-type f -print | sort | head -80\"}}]}. "
-        "Run enough focused commands to inspect the PR surface, project configuration, "
-        "tests, CI, risky files, and code quality signals before writing the review. "
         "Prefer cheap read-only commands such as find, sed, grep, python one-liners, "
         "and test/config discovery. Do not inspect .env*, .git, .venv, data, dist, local "
         "caches, credential files, or secret-looking files. Do not use git, rg, package "
         "managers, network access, or commands that write to the repository. If a command "
-        "is unavailable or fails, adapt once with simpler POSIX tools inside the same "
-        "exploration batch if possible. After the repo.bash batch, draft the review from "
-        "the available evidence and proceed to the comment/final step. If commenting is "
-        "enabled, you must call github.pr_comment exactly once before the final answer, "
+        "is unavailable or fails, adapt with simpler POSIX tools. Produce a concise code "
+        "review with concrete findings, test gaps, and a release-readiness "
+        "recommendation. If commenting is enabled, call github.pr_comment exactly once "
+        "before the final answer, "
         "shaped exactly like "
         "{\"tool_calls\":[{\"name\":\"github.pr_comment\",\"arguments\":"
         "{\"repo\":\"owner/name\",\"pr_number\":1,\"body\":\"review text\"}}]}.\n\n"
         f"{comment_instruction}"
-    )
-
-
-def _reply_prompt(replies: list[PullRequestReply]) -> str:
-    formatted_replies = "\n\n".join(
-        f"Comment {reply.comment_id} by {reply.author}:\n{reply.body}"
-        for reply in replies
-    )
-    return (
-        "You are continuing a GitHub PR review conversation. Use relevant stored memory "
-        "from prior runs. Treat the GitHub user replies below as feedback on review "
-        "style or follow-up instructions. If they express durable review preferences, "
-        "remember them for future PR reviews. Return a concise response explaining how "
-        "future reviews should adapt.\n\n"
-        f"GitHub user replies:\n{formatted_replies}"
     )
 
 
