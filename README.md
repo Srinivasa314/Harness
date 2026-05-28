@@ -2,36 +2,27 @@
 
 Harness is a Python framework for building observable, tool-using agents with
 real execution boundaries. It gives applications a small agent loop, pluggable
-model and embedding providers, capability-gated tools, durable memory, storage,
-sandboxed execution, and a local observability dashboard.
-
-The project is aimed at agents that need to run real tools safely enough to be
-useful: code review agents, repository assistants, operational copilots, and
-other workflows where model calls, tool calls, credentials, memory, and runtime
-state need to be inspectable instead of hidden inside a script.
+model and embedding providers, isolated tool execution, scoped memory, durable
+storage, and a local observability dashboard.
 
 ## What It Provides
 
-- **Agent runtime:** provider-neutral JSON protocol for final answers and
-  concurrent tool calls.
-- **Model providers:** built-in OpenAI Responses and Codex CLI providers, plus a
-  class-based `ModelProvider` interface for custom providers and tests.
-- **Tool execution layer:** capability checks, tool schemas, secret resolution,
-  output validation, and persistence-safe redaction.
-- **Execution backends:** in-process, subprocess, and Docker executors, including
-  named container schemas and session-scoped containers.
-- **Storage:** SQLite for local filesystem-backed runs and Postgres for shared
-  or service-style deployments.
-- **Memory:** scoped session, agent, and global memories backed by MiniLM,
-  OpenAI embeddings, or deterministic test embeddings.
-- **Context compaction:** rolling transcript summarization through the active
-  model provider when context approaches configured limits.
-- **Session ownership:** storage-backed leases prevent two runtimes from
-  executing the same session at the same time.
-- **Observability:** structured events, model turns, tool traces, artifacts,
-  session export, and a NiceGUI dashboard.
-- **Testing support:** deterministic local tests plus opt-in provider,
-  container, and Postgres e2e suites.
+- **Agent runtime and providers:** provider-neutral JSON for final answers and
+  concurrent tool calls, built-in OpenAI Responses and Codex CLI inference, and
+  class-based provider interfaces for application-specific implementations.
+- **Secure tool execution:** capability checks, input and output schemas,
+  isolated secret resolution, persistence-safe redaction, in-process,
+  subprocess, and Docker execution, plus named container schemas for filesystem,
+  network, resource, privilege, and lifecycle controls.
+- **State and memory:** SQLite or Postgres persistence for sessions, turns,
+  events, calls, artifacts, leases, and memories; scoped retrieval memory backed
+  by MiniLM, OpenAI embeddings, or deterministic test embeddings.
+- **Session lifecycle:** storage-backed session leases, persistent
+  session-scoped containers, delayed Docker cleanup, and context compaction
+  through the active model provider.
+- **Observability and validation:** structured runtime events, tool traces,
+  redacted exports, a local NiceGUI dashboard, deterministic local tests, and
+  opt-in provider, Docker, and Postgres e2e tests.
 
 ## Runtime Shape
 
@@ -50,6 +41,27 @@ caller
 Each boundary is replaceable in code. Registries are available when an
 application wants settings-selected implementations, but providers can also be
 injected directly.
+
+## Security Model
+
+Harness treats model output as a request for work, not as authority to perform
+that work. Every tool call goes through `ToolExecutionGateway`, which validates
+arguments, checks required capabilities, resolves declared secrets only after
+policy passes, dispatches to the selected executor, validates declared outputs,
+and redacts arguments, outputs, errors, metadata, artifacts, memory text, and
+events before durable persistence.
+
+Credential isolation is explicit. Tools declare the secret names they need, and
+the default resolver reads only `HARNESS_SECRET_...` variables for those names.
+The Codex CLI provider starts `codex exec` with an allowlisted environment so
+Harness secrets and unrelated ambient credentials are not inherited by the
+model subprocess. Docker tools receive declared secrets only in the per-call
+JSON payload, not as long-lived container environment variables.
+
+Docker sandboxing is controlled by container schemas rather than by individual
+tool prompts. Schemas define the image, working directory, mounts, network
+posture, Linux capabilities, privilege posture, resource limits, timeout, secret
+eligibility, and whether tools share a persistent session container.
 
 ## Quick Start
 
@@ -135,6 +147,24 @@ composed directly in Python. Common extension points include:
 - `ToolRegistry` for application tools.
 
 See [Configuration](docs/configuration.md) for settings and injection examples.
+
+## Storage, Memory, And Observability
+
+Storage backends persist the operational record: sessions, turns, events, tool
+calls, artifacts, leases, and memory records. SQLite is the local default, while
+Postgres is available for shared deployments or service-style operation.
+
+Memory is retrieval state, separate from transcript compaction. Harness supports
+`session`, `agent`, and `global` scopes, stores embedding metadata with each
+memory, and retrieves only memories compatible with the active embedding
+configuration. Agents can write memories through the generic `memory.store` tool
+when granted `memory:write`, while applications can also write through
+`MemoryManager` directly.
+
+The dashboard is a local read-only view over the stored runtime record. It shows
+session summaries, aggregate counts, turns, events, tool calls, artifacts, and
+tool status filters, and uses the same redacted records available through
+session export.
 
 ## Documentation
 
