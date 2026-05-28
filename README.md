@@ -7,7 +7,7 @@ storage, and a local observability dashboard.
 
 ## What It Provides
 
-- **Agent runtime and providers:** provider-neutral JSON for final answers and
+- **Agent runtime and providers:** provider-neutral JSON for responses and
   concurrent tool calls, built-in OpenAI Responses and Codex CLI inference, and
   class-based provider interfaces for application-specific implementations.
 - **Secure tool execution:** capability checks, input and output schemas,
@@ -17,12 +17,8 @@ storage, and a local observability dashboard.
 - **State and memory:** SQLite or Postgres persistence for sessions, turns,
   events, calls, artifacts, leases, and memories; scoped retrieval memory backed
   by MiniLM, OpenAI embeddings, or deterministic test embeddings.
-- **Session lifecycle:** storage-backed session leases, persistent
-  session-scoped containers, delayed Docker cleanup, and context compaction
-  through the active model provider.
-- **Observability and validation:** structured runtime events, tool traces,
-  redacted exports, a local NiceGUI dashboard, deterministic local tests, and
-  opt-in provider, Docker, and Postgres e2e tests.
+- **Observability:** structured runtime events, tool traces, redacted exports
+  and a local NiceGUI dashboard.
 
 ## Runtime Shape
 
@@ -129,10 +125,11 @@ main end-to-end example. It reviews a real pull request using:
 - a credentialized GitHub comment tool;
 - context compaction and dashboard observability.
 
-It is intentionally generic: the agent clones the PR, explores the repository
-with shell commands inside the configured container, reads directly addressed
-review instructions from PR comments, stores durable preferences through the
-framework memory tool, and posts its review through a tool call.
+It is intentionally generic: the agent copies git-tracked files from a local PR
+checkout into a temporary review workspace, explores that workspace with shell
+commands inside the configured container, reads directly addressed review
+instructions from PR comments, stores durable preferences through the framework
+memory tool, and posts its review through a tool call.
 
 ## Configuration
 

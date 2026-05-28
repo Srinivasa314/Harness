@@ -131,7 +131,6 @@ class PostgresStorage(StorageBackend):
                   embedding_dimensions integer,
                   metadata jsonb not null,
                   scope text not null,
-                  importance double precision not null default 1.0,
                   confidence double precision not null,
                   source_session_id text,
                   source_turn_id text,
@@ -515,12 +514,12 @@ class PostgresStorage(StorageBackend):
             insert into memories (
               id, namespace, text, embedding, embedding_provider, embedding_model,
               embedding_dimensions, metadata, scope,
-              importance, confidence, source_session_id, source_turn_id, updated_at,
+              confidence, source_session_id, source_turn_id, updated_at,
               last_used_at, expires_at, created_at
             )
             values (
-              $1, $2, $3, $4::jsonb, $5, $6, $7, $8::jsonb, $9, $10, $11,
-              $12, $13, $14, $15, $16, $17
+              $1, $2, $3, $4::jsonb, $5, $6, $7, $8::jsonb, $9, $10,
+              $11, $12, $13, $14, $15, $16
             )
             """,
             memory.id,
@@ -532,7 +531,6 @@ class PostgresStorage(StorageBackend):
             memory.embedding_dimensions,
             to_json(redact(memory.metadata, memory_secrets)),
             memory.scope.value,
-            1.0,
             memory.confidence,
             memory.source_session_id,
             memory.source_turn_id,

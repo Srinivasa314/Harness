@@ -2608,7 +2608,7 @@ async def test_docker_executor_rejects_mount_outside_allowed_root(tmp_path):
 
 
 @pytest.mark.anyio
-async def test_docker_executor_mounts_allowed_directory_read_write_by_default(
+async def test_docker_executor_mounts_allowed_directory_read_only_by_default(
     tmp_path,
     monkeypatch,
 ):
@@ -2646,7 +2646,7 @@ async def test_docker_executor_mounts_allowed_directory_read_write_by_default(
 
     assert result.status == "ok"
     run_command = next(command for command in commands if command[1] == "run")
-    assert f"{tmp_path.resolve()}:/work:rw" in run_command
+    assert f"{tmp_path.resolve()}:/work:ro" in run_command
 
 
 @pytest.mark.anyio
