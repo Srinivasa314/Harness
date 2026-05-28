@@ -111,6 +111,7 @@ def test_github_pr_example_registers_comment_tool() -> None:
     pr_comment = definitions["github.pr_comment"]
     assert pr_context.required_secrets == ["github_app_private_key"]
     assert pr_comment.required_secrets == ["github_app_private_key"]
+    assert pr_comment.input_schema["required"] == ["repo", "pr_number", "body"]
 
 
 def test_github_pr_example_registers_run_scoped_tools(tmp_path: Path) -> None:
@@ -503,6 +504,7 @@ async def test_github_pr_example_posts_agent_comment(monkeypatch: pytest.MonkeyP
         url = await module.post_pr_comment(
             repo="owner/repo",
             pr_number=7,
+            body="Looks ready.",
             token="secret-token",
         )
     finally:
@@ -513,7 +515,7 @@ async def test_github_pr_example_posts_agent_comment(monkeypatch: pytest.MonkeyP
     assert captured["authorization"] == "Bearer secret-token"
     assert isinstance(captured["payload"], dict)
     assert "Harness PR Review Agent" in str(captured["payload"]["body"])
-    assert module.PUBLIC_COMMENT_BODY in str(captured["payload"]["body"])
+    assert "Looks ready." in str(captured["payload"]["body"])
 
 
 @pytest.mark.anyio
@@ -562,11 +564,13 @@ async def test_github_pr_example_comment_tool_uses_github_app_token(
         *,
         repo: str,
         pr_number: int,
+        body: str,
         token: str,
     ) -> str:
         captured["comment"] = {
             "repo": repo,
             "pr_number": pr_number,
+            "body": body,
             "token": token,
         }
         return "https://github.test/comment"
@@ -584,6 +588,7 @@ async def test_github_pr_example_comment_tool_uses_github_app_token(
     assert captured["comment"] == {
         "repo": "owner/repo",
         "pr_number": 7,
+        "body": "Ready.",
         "token": "installation-token",
     }
 

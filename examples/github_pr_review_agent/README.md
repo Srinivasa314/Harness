@@ -11,6 +11,11 @@ main runtime features together:
 - Context compaction.
 - SQLite observability records and dashboard inspection.
 
+Use this example only with repositories and pull requests you trust. The agent
+can inspect the local checkout, run arbitrary read-only shell commands inside a
+Docker container, and publish its review text to the PR through a GitHub App
+comment.
+
 Required settings:
 
 ```bash

@@ -45,10 +45,6 @@ GITHUB_PAGE_SIZE = 100
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
 TRUSTED_REPLY_ASSOCIATIONS = {"OWNER"}
-PUBLIC_COMMENT_BODY = (
-    "Review completed by the Harness PR review agent. See the local run output "
-    "and dashboard for the detailed review."
-)
 PREFERENCE_MARKERS = (
     "always",
     "avoid",
@@ -305,11 +301,12 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
 async def github_pr_comment(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, str]:
     repo = str(arguments["repo"])
     pr_number = int(arguments["pr_number"])
-    _ = arguments.get("body")
+    body = str(arguments["body"])
     token = await github_app_installation_token(secrets)
     url = await post_pr_comment(
         repo=repo,
         pr_number=pr_number,
+        body=body,
         token=token,
     )
     return {"url": url}
@@ -489,21 +486,18 @@ def build_registry() -> ToolRegistry:
             execution_mode=ExecutionMode.IN_PROCESS,
             required_capabilities=["github:comment"],
             required_secrets=["github_app_private_key"],
-                input_schema={
-                    "type": "object",
-                    "required": ["repo", "pr_number"],
-                    "properties": {
-                        "repo": {"type": "string"},
-                        "pr_number": {"type": "integer"},
-                        "body": {
-                            "type": "string",
-                            "description": (
-                                "Ignored. The public GitHub comment body is fixed by "
-                                "the tool to avoid posting model-controlled content."
-                            ),
-                        },
+            input_schema={
+                "type": "object",
+                "required": ["repo", "pr_number", "body"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                    "body": {
+                        "type": "string",
+                        "description": "Markdown review comment to post to the pull request.",
                     },
-                    "additionalProperties": False,
+                },
+                "additionalProperties": False,
             },
             output_schema={
                 "type": "object",
@@ -790,18 +784,17 @@ async def main() -> None:
         review_workspace.cleanup()
 
 
-async def post_pr_comment(*, repo: str, pr_number: int, token: str) -> str:
+async def post_pr_comment(*, repo: str, pr_number: int, body: str, token: str) -> str:
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    body = _comment_body(PUBLIC_COMMENT_BODY)
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
             headers=headers,
-            json={"body": body},
+            json={"body": _comment_body(body)},
         )
     response.raise_for_status()
     payload = response.json()
@@ -925,7 +918,7 @@ def _review_prompt(
         "is unavailable or fails, adapt with simpler POSIX tools.\n\n"
         "Produce a concise code review with concrete findings, test gaps, and a "
         "release-readiness recommendation. For fresh reviews, call github.pr_comment "
-        "exactly once to post the fixed public completion marker, then return the "
+        "exactly once to post the review to the pull request, then return the "
         "detailed review and the comment URL in the final answer."
     )
 
