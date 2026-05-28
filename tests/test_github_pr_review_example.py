@@ -11,6 +11,8 @@ from typing import Any
 import httpx
 import pytest
 
+from harness.schemas import MemoryRecord
+
 
 def test_github_pr_example_bash_runner_explores_generic_repo(tmp_path: Path) -> None:
     module = _load_example_module()
@@ -90,21 +92,34 @@ async def test_github_pr_example_extracts_user_review_preferences() -> None:
             session_id="session-1",
             user_message=(
                 "You are continuing a GitHub PR review conversation.\n\n"
-                "User reply:\n"
+                "GitHub user replies:\n"
+                "Comment 101 by alice:\n"
                 "- Prefer stricter comments on missing tests.\n"
-                "- Always include migration risk."
+                "- Always include migration risk.\n\n"
+                "Comment 102 by bob:\n"
+                "Thanks for the review."
             ),
             assistant_message="noted",
         )
     )
 
     assert [memory.metadata for memory in memories] == [
-        {"source": "user_review_preference"},
-        {"source": "user_review_preference"},
+        {
+            "source": "github_pr_comment",
+            "github_comment_id": 101,
+            "github_comment_author": "alice",
+        },
+        {
+            "source": "github_pr_comment",
+            "github_comment_id": 101,
+            "github_comment_author": "alice",
+        },
     ]
     assert memories[0].scope == module.MemoryScope.AGENT
     assert "Prefer stricter comments" in memories[0].text
     assert "Always include migration risk" in memories[1].text
+    assert memories[0].metadata["github_comment_id"] == 101
+    assert memories[0].metadata["github_comment_author"] == "alice"
 
 
 @pytest.mark.anyio
@@ -115,12 +130,117 @@ async def test_github_pr_example_ignores_non_preference_replies() -> None:
     memories = await extractor.extract(
         module.MemoryExchange(
             session_id="session-1",
-            user_message="User reply:\nThanks for the review.",
+            user_message="GitHub user replies:\nComment 101 by alice:\nThanks for the review.",
             assistant_message="noted",
         )
     )
 
     assert memories == []
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_fetches_user_replies_after_last_agent_comment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_example_module()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://api.github.test/repos/owner/repo")
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "body": "Earlier user comment",
+                    "user": {"login": "alice"},
+                },
+                {
+                    "id": 2,
+                    "body": f"{module.AGENT_COMMENT_MARKER}\nAgent review",
+                    "user": {"login": "review-app"},
+                },
+                {
+                    "id": 3,
+                    "body": "Prefer stricter test comments.",
+                    "user": {"login": "alice"},
+                },
+                {
+                    "id": 4,
+                    "body": f"{module.AGENT_COMMENT_MARKER}\nAgent follow-up",
+                    "user": {"login": "review-app"},
+                },
+                {
+                    "id": 5,
+                    "body": "Always include rollout risk.",
+                    "user": {"login": "bob"},
+                },
+            ],
+        )
+
+    monkeypatch.setattr(module, "GITHUB_API", "https://api.github.test")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: client)
+
+    try:
+        replies = await module.fetch_pr_user_replies(
+            repo="owner/repo",
+            pr_number=7,
+            token="installation-token",
+        )
+    finally:
+        await client.aclose()
+
+    assert replies == [
+        module.PullRequestReply(
+            comment_id=5,
+            author="bob",
+            body="Always include rollout risk.",
+        )
+    ]
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_filters_already_processed_replies(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_example_module()
+    storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
+    await storage.migrate()
+    await storage.save_memory(
+        MemoryRecord(
+            namespace="github-pr-review-demo",
+            text="For GitHub PR reviews, user preference: Prefer tests.",
+            embedding=[1.0],
+            metadata={"source": "github_pr_comment", "github_comment_id": 3},
+            scope=module.MemoryScope.AGENT,
+        )
+    )
+
+    async def fake_fetch_pr_user_replies(
+        *,
+        repo: str,
+        pr_number: int,
+        token: str,
+    ) -> list[Any]:
+        assert repo == "owner/repo"
+        assert pr_number == 7
+        assert token == "installation-token"
+        return [
+            module.PullRequestReply(3, "alice", "Prefer tests."),
+            module.PullRequestReply(4, "bob", "Always include migration risk."),
+        ]
+
+    monkeypatch.setattr(module, "fetch_pr_user_replies", fake_fetch_pr_user_replies)
+
+    replies = await module._unprocessed_replies(
+        storage,
+        repo="owner/repo",
+        pr_number=7,
+        token="installation-token",
+    )
+
+    assert replies == [module.PullRequestReply(4, "bob", "Always include migration risk.")]
 
 
 @pytest.mark.anyio

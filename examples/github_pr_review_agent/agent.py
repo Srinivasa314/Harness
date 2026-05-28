@@ -5,7 +5,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import anyio
 import httpx
@@ -53,6 +53,12 @@ PREFERENCE_MARKERS = (
     "skip",
 )
 
+
+class PullRequestReply(NamedTuple):
+    comment_id: int
+    author: str
+    body: str
+
 BASH_RUNNER = r"""
 import json
 import os
@@ -91,16 +97,50 @@ print(json.dumps({
 """
 
 
-def _user_reply_from_message(message: str) -> str:
-    marker = "User reply:"
+def _user_replies_from_message(message: str) -> list[PullRequestReply]:
+    marker = "GitHub user replies:"
     if marker not in message:
-        return ""
-    return message.split(marker, 1)[1].strip()
+        return []
+    replies: list[PullRequestReply] = []
+    current_id: int | None = None
+    current_author = ""
+    current_body: list[str] = []
+    for raw_line in message.split(marker, 1)[1].splitlines():
+        line = raw_line.strip()
+        if line.startswith("Comment ") and " by " in line and line.endswith(":"):
+            if current_id is not None:
+                replies.append(
+                    PullRequestReply(
+                        comment_id=current_id,
+                        author=current_author,
+                        body="\n".join(current_body).strip(),
+                    )
+                )
+            header = line.removesuffix(":")
+            comment_part, author = header.split(" by ", 1)
+            try:
+                current_id = int(comment_part.removeprefix("Comment ").strip())
+            except ValueError:
+                current_id = None
+            current_author = author.strip()
+            current_body = []
+            continue
+        if current_id is not None:
+            current_body.append(raw_line)
+    if current_id is not None:
+        replies.append(
+            PullRequestReply(
+                comment_id=current_id,
+                author=current_author,
+                body="\n".join(current_body).strip(),
+            )
+        )
+    return [reply for reply in replies if reply.body]
 
 
-def _preference_memories(user_reply: str) -> list[MemoryCandidate]:
+def _preference_memories(reply: PullRequestReply) -> list[MemoryCandidate]:
     memories: list[MemoryCandidate] = []
-    for raw_line in user_reply.splitlines():
+    for raw_line in reply.body.splitlines():
         line = raw_line.strip(" -\t")
         if not line:
             continue
@@ -111,18 +151,26 @@ def _preference_memories(user_reply: str) -> list[MemoryCandidate]:
             MemoryCandidate(
                 text=f"For GitHub PR reviews, user preference: {line}",
                 scope=MemoryScope.AGENT,
-                metadata={"source": "user_review_preference"},
+                metadata={
+                    "source": "github_pr_comment",
+                    "github_comment_id": reply.comment_id,
+                    "github_comment_author": reply.author,
+                },
             )
         )
     if memories:
         return memories
-    lowered_reply = user_reply.lower()
+    lowered_reply = reply.body.lower()
     if any(marker in lowered_reply for marker in PREFERENCE_MARKERS):
         return [
             MemoryCandidate(
-                text=f"For GitHub PR reviews, user preference: {user_reply.strip()}",
+                text=f"For GitHub PR reviews, user preference: {reply.body.strip()}",
                 scope=MemoryScope.AGENT,
-                metadata={"source": "user_review_preference"},
+                metadata={
+                    "source": "github_pr_comment",
+                    "github_comment_id": reply.comment_id,
+                    "github_comment_author": reply.author,
+                },
             )
         ]
     return []
@@ -130,9 +178,13 @@ def _preference_memories(user_reply: str) -> list[MemoryCandidate]:
 
 class ReviewPreferenceMemoryExtractor(MemoryExtractor):
     async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
-        user_reply = _user_reply_from_message(exchange.user_message)
-        if user_reply:
-            return _preference_memories(user_reply)
+        replies = _user_replies_from_message(exchange.user_message)
+        if replies:
+            return [
+                memory
+                for reply in replies
+                for memory in _preference_memories(reply)
+            ]
         _ = exchange
         return []
 
@@ -245,6 +297,46 @@ async def github_app_installation_token(secrets: dict[str, str]) -> str:
     if not isinstance(token, str) or not token:
         raise RuntimeError("GitHub App installation token response did not include a token.")
     return token
+
+
+async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> list[PullRequestReply]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    comments: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        comments = await _get_paginated_list(
+            client,
+            f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
+            headers=headers,
+            list_key=None,
+        )
+    last_agent_index = -1
+    for index, comment in enumerate(comments):
+        body = comment.get("body")
+        if isinstance(body, str) and AGENT_COMMENT_MARKER in body:
+            last_agent_index = index
+    replies: list[PullRequestReply] = []
+    for comment in comments[last_agent_index + 1:]:
+        body = comment.get("body")
+        user = comment.get("user")
+        comment_id = comment.get("id")
+        if not isinstance(body, str) or AGENT_COMMENT_MARKER in body:
+            continue
+        if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+            continue
+        if not isinstance(comment_id, int):
+            continue
+        replies.append(
+            PullRequestReply(
+                comment_id=comment_id,
+                author=user["login"],
+                body=body.strip(),
+            )
+        )
+    return replies
 
 
 async def _get_paginated_list(
@@ -402,7 +494,6 @@ async def main() -> None:
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
     comment_enabled = _comment_enabled()
-    user_reply = os.environ.get("HARNESS_REVIEW_REPLY", "").strip()
     requested_session_id = os.environ.get("HARNESS_SESSION_ID", "").strip()
     tool_capabilities = ["github:pr", "repo:sandbox"]
     if comment_enabled:
@@ -481,10 +572,22 @@ async def main() -> None:
             pr_number=pr_number,
             repo_path=repo_path,
         )
+        github_token = await github_app_installation_token(
+            {"github_app_private_key": os.environ["HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"]}
+        )
+        replies = await _unprocessed_replies(
+            storage,
+            repo=repo,
+            pr_number=pr_number,
+            token=github_token,
+        )
+        is_follow_up = bool(replies)
 
         loop = runtime.agent_loop(
             max_iterations=12,
-            stop_after_tools={"github.pr_comment"} if comment_enabled and not user_reply else None,
+            stop_after_tools=(
+                {"github.pr_comment"} if comment_enabled and not is_follow_up else None
+            ),
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
@@ -499,7 +602,7 @@ async def main() -> None:
         )
         result = await loop.run(
             session.id,
-            _reply_prompt(user_reply) if user_reply else _review_prompt(
+            _reply_prompt(replies) if is_follow_up else _review_prompt(
                 repo=repo,
                 pr_number=pr_number,
                 repo_path=repo_path,
@@ -512,7 +615,7 @@ async def main() -> None:
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
         comment_url = _comment_url_from_results(result.tool_results)
-        if comment_enabled and not user_reply and comment_url is None:
+        if comment_enabled and not is_follow_up and comment_url is None:
             raise RuntimeError("Review finished without posting a PR comment.")
 
         print(
@@ -528,7 +631,7 @@ async def main() -> None:
                     "tool_statuses": {call.tool_name: call.status for call in tool_calls},
                     "memory_ids_injected": result.memory_ids,
                     "comment_url": comment_url,
-                    "reply_processed": bool(user_reply),
+                    "reply_comment_ids_processed": [reply.comment_id for reply in replies],
                     "counts": {
                         "turns": len(turns),
                         "tool_calls": len(tool_calls),
@@ -590,6 +693,23 @@ async def _load_or_create_session(
         session = Session(metadata=metadata)
     await storage.create_session(session)
     return session
+
+
+async def _unprocessed_replies(
+    storage: SQLiteStorage,
+    *,
+    repo: str,
+    pr_number: int,
+    token: str,
+) -> list[PullRequestReply]:
+    replies = await fetch_pr_user_replies(repo=repo, pr_number=pr_number, token=token)
+    memories = await storage.list_memories("github-pr-review-demo", scopes=[MemoryScope.AGENT])
+    processed_ids = {
+        memory.metadata.get("github_comment_id")
+        for memory in memories
+        if memory.metadata.get("source") == "github_pr_comment"
+    }
+    return [reply for reply in replies if reply.comment_id not in processed_ids]
 
 
 def _comment_body(review: str) -> str:
@@ -667,14 +787,18 @@ def _review_prompt(
     )
 
 
-def _reply_prompt(user_reply: str) -> str:
+def _reply_prompt(replies: list[PullRequestReply]) -> str:
+    formatted_replies = "\n\n".join(
+        f"Comment {reply.comment_id} by {reply.author}:\n{reply.body}"
+        for reply in replies
+    )
     return (
         "You are continuing a GitHub PR review conversation. Use relevant stored memory "
-        "from prior runs. Treat the user reply below as feedback on review style or "
-        "follow-up instructions. If it expresses durable review preferences, remember "
-        "them for future PR reviews. Return a concise response explaining how future "
-        "reviews should adapt.\n\n"
-        f"User reply:\n{user_reply}"
+        "from prior runs. Treat the GitHub user replies below as feedback on review "
+        "style or follow-up instructions. If they express durable review preferences, "
+        "remember them for future PR reviews. Return a concise response explaining how "
+        "future reviews should adapt.\n\n"
+        f"GitHub user replies:\n{formatted_replies}"
     )
 
 
