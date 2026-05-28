@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from typing import Any, NamedTuple
 
+import aiosqlite
 import anyio
 import httpx
 import jwt
@@ -26,6 +27,7 @@ from harness.schemas import (
     MemoryScope,
     Session,
     ToolDefinition,
+    utc_now,
 )
 from harness.storage import SQLiteStorage
 from harness.tools import CapabilityGrant, CapabilityPolicy, EnvSecretResolver, ToolRegistry
@@ -494,7 +496,6 @@ async def main() -> None:
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
     comment_enabled = _comment_enabled()
-    requested_session_id = os.environ.get("HARNESS_SESSION_ID", "").strip()
     tool_capabilities = ["github:pr", "repo:sandbox"]
     if comment_enabled:
         tool_capabilities.append("github:comment")
@@ -565,13 +566,15 @@ async def main() -> None:
         assert runtime.memory is not None
         runtime.memory.extractor = ReviewPreferenceMemoryExtractor()
 
-        session = await _load_or_create_session(
-            storage,
-            session_id=requested_session_id or None,
-            repo=repo,
-            pr_number=pr_number,
-            repo_path=repo_path,
+        session = Session(
+            metadata={
+                "example": "github_pr_review_agent",
+                "repo": repo,
+                "pr": pr_number,
+                "repo_path": str(repo_path),
+            }
         )
+        await storage.create_session(session)
         github_token = await github_app_installation_token(
             {"github_app_private_key": os.environ["HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"]}
         )
@@ -608,6 +611,12 @@ async def main() -> None:
                 repo_path=repo_path,
                 comment_enabled=comment_enabled,
             ),
+        )
+        await _mark_replies_processed(
+            storage,
+            repo=repo,
+            pr_number=pr_number,
+            replies=replies,
         )
 
         turns = await storage.list_turns(session.id, limit=None)
@@ -670,31 +679,6 @@ async def post_pr_comment(*, repo: str, pr_number: int, token: str, review: str)
     return str(url) if isinstance(url, str) else ""
 
 
-async def _load_or_create_session(
-    storage: SQLiteStorage,
-    *,
-    session_id: str | None,
-    repo: str,
-    pr_number: int,
-    repo_path: Path,
-) -> Session:
-    metadata = {
-        "example": "github_pr_review_agent",
-        "repo": repo,
-        "pr": pr_number,
-        "repo_path": str(repo_path),
-    }
-    if session_id:
-        existing = await storage.get_session(session_id)
-        if existing is not None:
-            return existing
-        session = Session(id=session_id, metadata=metadata)
-    else:
-        session = Session(metadata=metadata)
-    await storage.create_session(session)
-    return session
-
-
 async def _unprocessed_replies(
     storage: SQLiteStorage,
     *,
@@ -702,14 +686,61 @@ async def _unprocessed_replies(
     pr_number: int,
     token: str,
 ) -> list[PullRequestReply]:
+    await _ensure_processed_comments_table(storage)
     replies = await fetch_pr_user_replies(repo=repo, pr_number=pr_number, token=token)
-    memories = await storage.list_memories("github-pr-review-demo", scopes=[MemoryScope.AGENT])
-    processed_ids = {
-        memory.metadata.get("github_comment_id")
-        for memory in memories
-        if memory.metadata.get("source") == "github_pr_comment"
-    }
+    async with aiosqlite.connect(storage.path) as db:
+        rows = await db.execute_fetchall(
+            """
+            select comment_id from github_pr_review_processed_comments
+            where repo = ? and pr_number = ?
+            """,
+            (repo, pr_number),
+        )
+    processed_ids = {int(row[0]) for row in rows}
     return [reply for reply in replies if reply.comment_id not in processed_ids]
+
+
+async def _mark_replies_processed(
+    storage: SQLiteStorage,
+    *,
+    repo: str,
+    pr_number: int,
+    replies: list[PullRequestReply],
+) -> None:
+    if not replies:
+        return
+    await _ensure_processed_comments_table(storage)
+    async with aiosqlite.connect(storage.path) as db:
+        await db.executemany(
+            """
+            insert or ignore into github_pr_review_processed_comments (
+              repo, pr_number, comment_id, author, processed_at
+            )
+            values (?, ?, ?, ?, ?)
+            """,
+            [
+                (repo, pr_number, reply.comment_id, reply.author, utc_now().isoformat())
+                for reply in replies
+            ],
+        )
+        await db.commit()
+
+
+async def _ensure_processed_comments_table(storage: SQLiteStorage) -> None:
+    async with aiosqlite.connect(storage.path) as db:
+        await db.execute(
+            """
+            create table if not exists github_pr_review_processed_comments (
+              repo text not null,
+              pr_number integer not null,
+              comment_id integer not null,
+              author text not null,
+              processed_at text not null,
+              primary key (repo, pr_number, comment_id)
+            )
+            """
+        )
+        await db.commit()
 
 
 def _comment_body(review: str) -> str:

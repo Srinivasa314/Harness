@@ -8,10 +8,9 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import aiosqlite
 import httpx
 import pytest
-
-from harness.schemas import MemoryRecord
 
 
 def test_github_pr_example_bash_runner_explores_generic_repo(tmp_path: Path) -> None:
@@ -207,14 +206,11 @@ async def test_github_pr_example_filters_already_processed_replies(
     module = _load_example_module()
     storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
     await storage.migrate()
-    await storage.save_memory(
-        MemoryRecord(
-            namespace="github-pr-review-demo",
-            text="For GitHub PR reviews, user preference: Prefer tests.",
-            embedding=[1.0],
-            metadata={"source": "github_pr_comment", "github_comment_id": 3},
-            scope=module.MemoryScope.AGENT,
-        )
+    await module._mark_replies_processed(
+        storage,
+        repo="owner/repo",
+        pr_number=7,
+        replies=[module.PullRequestReply(3, "alice", "Prefer tests.")],
     )
 
     async def fake_fetch_pr_user_replies(
@@ -241,6 +237,37 @@ async def test_github_pr_example_filters_already_processed_replies(
     )
 
     assert replies == [module.PullRequestReply(4, "bob", "Always include migration risk.")]
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_tracks_processed_replies_separately(tmp_path: Path) -> None:
+    module = _load_example_module()
+    storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
+    await storage.migrate()
+
+    await module._mark_replies_processed(
+        storage,
+        repo="owner/repo",
+        pr_number=7,
+        replies=[
+            module.PullRequestReply(3, "alice", "Prefer tests."),
+            module.PullRequestReply(4, "bob", "Always include migration risk."),
+        ],
+    )
+
+    async with aiosqlite.connect(storage.path) as db:
+        rows = await db.execute_fetchall(
+            """
+            select repo, pr_number, comment_id, author
+            from github_pr_review_processed_comments
+            order by comment_id
+            """
+        )
+
+    assert [tuple(row) for row in rows] == [
+        ("owner/repo", 7, 3, "alice"),
+        ("owner/repo", 7, 4, "bob"),
+    ]
 
 
 @pytest.mark.anyio

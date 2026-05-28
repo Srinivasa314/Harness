@@ -56,18 +56,18 @@ The example requires Docker for the sandboxed project-check tool.
 It keeps its SQLite database by default so memories can carry across runs. Set
 `HARNESS_EXAMPLE_RESET_DB=1` to start from a clean database.
 
-To continue an existing review conversation and teach review preferences, reply
-on the GitHub PR after the agent's comment, then rerun the example with the
-previous `session_id`:
+To teach review preferences, reply on the GitHub PR after the agent's comment,
+then rerun the example:
 
 ```bash
-export HARNESS_SESSION_ID=...
 uv run python examples/github_pr_review_agent/agent.py
 ```
 
 The example reads PR comments after the latest Harness agent comment, ignores
-agent comments, skips comments already captured into memory, and stores durable
-preference memories at agent scope for later PR reviews in the same namespace.
+agent comments, skips comments already processed in its local SQLite tracking
+table, and stores durable preference memories at agent scope for later PR
+reviews in the same namespace. Each run uses a new Harness session; memory
+provides continuity across runs.
 
 To post the review as a PR comment:
 
