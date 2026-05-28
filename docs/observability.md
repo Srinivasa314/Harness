@@ -58,9 +58,10 @@ filenames receive unique suffixes instead of overwriting existing files.
 ## Dashboard
 
 The NiceGUI dashboard is a local read-only view over persisted sessions, turns,
-events, tool calls, and artifacts. Memory records are persisted and available
-through storage APIs and session exports, but they do not currently have a
-dedicated dashboard tab.
+events, tool calls, and artifacts. The top-level dashboard supports all-session
+aggregate counts, per-session summaries, session filtering, and tool-status
+filtering. Memory records are persisted and available through storage APIs and
+session exports, but they do not currently have a dedicated dashboard tab.
 
 ```bash
 uv run harness dashboard

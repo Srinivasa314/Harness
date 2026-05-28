@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
+import tempfile
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
+import aiosqlite
 import anyio
 import httpx
+import jwt
 
 from harness.agent import ContextCompactionPolicy, RollingSummaryContextCompactor
 from harness.config import HarnessSettings
@@ -17,232 +22,122 @@ from harness.execution import (
     DockerContainerExecutor,
     InProcessExecutor,
 )
-from harness.memory import MemoryCandidate, MemoryExchange, MemoryExtractor
+from harness.memory import MemoryManager
 from harness.runtime import build_runtime_async
 from harness.schemas import (
     ContainerSchema,
     ExecutionMode,
-    MemoryScope,
     Session,
     ToolDefinition,
+    utc_now,
 )
 from harness.storage import SQLiteStorage
-from harness.tools import CapabilityGrant, CapabilityPolicy, EnvSecretResolver, ToolRegistry
+from harness.tools import (
+    CapabilityGrant,
+    CapabilityPolicy,
+    EnvSecretResolver,
+    ToolRegistry,
+)
+from harness.tools.memory import register_memory_tools
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO_DB = ROOT / "data" / "github_pr_review_agent.sqlite3"
 HF_CACHE = ROOT / "data" / "hf-cache"
 ST_CACHE = ROOT / "data" / "sentence-transformers"
 GITHUB_API = "https://api.github.com"
-MAX_REPO_FILES = 500
-MAX_CONFIG_CHARS = 4_000
-CONFIG_FILENAMES = {
-    ".github/dependabot.yml",
-    ".github/dependabot.yaml",
-    ".pre-commit-config.yaml",
-    ".semgrep.yml",
-    "Cargo.toml",
-    "Dockerfile",
-    "Gemfile",
-    "Makefile",
-    "build.gradle",
-    "build.gradle.kts",
-    "compose.yaml",
-    "docker-compose.yml",
-    "go.mod",
-    "package.json",
-    "pnpm-lock.yaml",
-    "pom.xml",
-    "pyproject.toml",
-    "requirements-dev.txt",
-    "requirements.txt",
-    "tsconfig.json",
-    "tox.ini",
-    "uv.lock",
-    "yarn.lock",
-}
-SKIP_DIRS = {
-    ".git",
-    ".hg",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    ".tox",
-    ".venv",
-    "__pycache__",
-    "dist",
-    "node_modules",
-    "target",
-}
+AGENT_COMMENT_MARKER = "<!-- harness-pr-review-agent -->"
+GITHUB_PAGE_SIZE = 100
+MAX_CHANGED_FILES_IN_CONTEXT = 80
+MAX_CHECK_RUNS_IN_CONTEXT = 50
+TRUSTED_REPLY_ASSOCIATIONS = {"OWNER"}
+DEFAULT_APP_SLUG = "harness-pr-review-agent"
 
-PROJECT_CHECKER = r"""
-from collections import Counter
+
+class PullRequestReply(NamedTuple):
+    comment_id: int
+    author: str
+    body: str
+
+BASH_RUNNER = r"""
 import json
+import os
+import subprocess
 import sys
+from pathlib import Path
 
 payload = json.load(sys.stdin)
-snapshot = payload["arguments"]["repo_snapshot"]
-files = [str(path) for path in snapshot.get("files", [])]
-config_files = snapshot.get("config_files", {})
-lower_files = [path.lower() for path in files]
-suffixes = Counter(path.rsplit(".", 1)[-1] for path in lower_files if "." in path)
-
-language_markers = {
-    "python": [".py", "pyproject.toml", "requirements.txt", "tox.ini"],
-    "javascript": [".js", "package.json"],
-    "typescript": [".ts", ".tsx", "tsconfig.json"],
-    "go": [".go", "go.mod"],
-    "rust": [".rs", "Cargo.toml"],
-    "java": [".java", "pom.xml", "build.gradle", "build.gradle.kts"],
-    "ruby": [".rb", "Gemfile"],
-    "shell": [".sh"],
-    "docker": ["Dockerfile", "docker-compose.yml", "compose.yaml"],
-}
-
-def has_marker(markers):
-    return any(
-        path.endswith(marker.lower()) or path == marker.lower()
-        for marker in markers
-        for path in lower_files
-    ) or any(marker in config_files for marker in markers)
-
-languages = sorted(name for name, markers in language_markers.items() if has_marker(markers))
-package_managers = []
-if "package.json" in config_files:
-    package_managers.append("npm-compatible")
-if "pnpm-lock.yaml" in lower_files:
-    package_managers.append("pnpm")
-if "yarn.lock" in lower_files:
-    package_managers.append("yarn")
-if "pyproject.toml" in config_files or "requirements.txt" in config_files:
-    package_managers.append("python")
-if "uv.lock" in config_files:
-    package_managers.append("uv")
-if "go.mod" in config_files:
-    package_managers.append("go modules")
-if "Cargo.toml" in config_files:
-    package_managers.append("cargo")
-if "pom.xml" in config_files:
-    package_managers.append("maven")
-if "build.gradle" in config_files or "build.gradle.kts" in config_files:
-    package_managers.append("gradle")
-if "Gemfile" in config_files:
-    package_managers.append("bundler")
-
-config_text = "\n".join(str(value).lower() for value in config_files.values())
-test_indicators = sorted({
-    indicator
-    for indicator in [
-        "pytest",
-        "unittest",
-        "jest",
-        "vitest",
-        "mocha",
-        "go test",
-        "cargo test",
-        "junit",
-        "rspec",
-    ]
-    if indicator in config_text
-})
-has_test_file = any(
-    "/test" in path or path.startswith("test") or ".test." in path or "_test." in path
-    for path in lower_files
-)
-if has_test_file:
-    test_indicators.append("test files present")
-
-ci_present = any(path.startswith(".github/workflows/") for path in lower_files) or any(
-    path in {".gitlab-ci.yml", "circle.yml", ".circleci/config.yml"} for path in lower_files
-)
-container_suffixes = ("dockerfile", "docker-compose.yml", "compose.yaml")
-container_files = sorted(path for path in files if path.lower().endswith(container_suffixes))
-security_indicators = sorted({
-    indicator
-    for indicator in [
-        "dependabot",
-        "codeql",
-        "semgrep",
-        "trivy",
-        "bandit",
-        "npm audit",
-        "cargo audit",
-    ]
-    if indicator in config_text or any(indicator in path for path in lower_files)
-})
-
-notes = []
-if not test_indicators:
-    notes.append("No obvious test configuration or test files were detected in the local snapshot.")
-if not ci_present:
-    notes.append("No common CI workflow file was detected in the local snapshot.")
-if not security_indicators:
-    notes.append("No common dependency or static-analysis security configuration was detected.")
-
+arguments = payload.get("arguments", {})
+command = str(arguments["command"])
+workdir = Path(os.environ.get("HARNESS_REPO_MOUNT", "/repo"))
+if not workdir.exists():
+    workdir = Path.cwd()
+try:
+    completed = subprocess.run(
+        ["/bin/sh", "-lc", command],
+        cwd=workdir,
+        capture_output=True,
+        text=True,
+        timeout=25,
+    )
+except subprocess.TimeoutExpired as exc:
+    stdout = exc.stdout or ""
+    stderr = exc.stderr or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
+    print(json.dumps({
+        "command": command,
+        "returncode": 124,
+        "stdout": stdout[-20000:],
+        "stderr": (stderr + "\nCommand timed out after 25 seconds.")[-12000:],
+    }))
+    raise SystemExit(0)
 print(json.dumps({
-    "root_name": snapshot.get("root_name"),
-    "file_count_sampled": len(files),
-    "top_extensions": suffixes.most_common(8),
-    "languages": languages,
-    "package_managers": sorted(set(package_managers)),
-    "test_indicators": sorted(set(test_indicators)),
-    "ci_present": ci_present,
-    "container_files": container_files[:20],
-    "security_indicators": security_indicators,
-    "notes": notes,
+    "command": command,
+    "returncode": completed.returncode,
+    "stdout": completed.stdout[-20000:],
+    "stderr": completed.stderr[-12000:],
 }))
 """
 
 
-class PullRequestMemoryExtractor(MemoryExtractor):
-    async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
-        candidates: list[MemoryCandidate] = []
-        for output in exchange.tool_outputs:
-            if output.get("name") != "github.pr_context":
+def _replies_from_tool_outputs(tool_outputs: list[dict[str, Any]]) -> list[PullRequestReply]:
+    replies: list[PullRequestReply] = []
+    for output in tool_outputs:
+        if output.get("name") != "github.pr_replies":
+            continue
+        payload = output.get("output")
+        if not isinstance(payload, dict):
+            continue
+        raw_replies = payload.get("replies")
+        if not isinstance(raw_replies, list):
+            continue
+        for raw_reply in raw_replies:
+            if not isinstance(raw_reply, dict):
                 continue
-            pr_context = output.get("output")
-            if not isinstance(pr_context, dict):
-                continue
-            repo = pr_context.get("repo")
-            changed_files = pr_context.get("changed_files")
-            check_runs = pr_context.get("check_runs")
-            if not isinstance(repo, str):
-                continue
-            changed_count = len(changed_files) if isinstance(changed_files, list) else 0
-            failed_checks = [
-                str(check.get("name"))
-                for check in check_runs or []
-                if isinstance(check, dict) and check.get("conclusion") not in {None, "success"}
-            ]
-            detail = f"Recent PR reviews for {repo} should consider {changed_count} changed files"
-            if failed_checks:
-                detail += f" and failed checks: {', '.join(failed_checks[:5])}"
-            candidates.append(
-                MemoryCandidate(
-                    text=detail,
-                    scope=MemoryScope.AGENT,
-                    importance=0.7,
-                    metadata={"source": "github_pr_context"},
-                )
-            )
-        if candidates:
-            return candidates
-        if "release-readiness" in exchange.assistant_message.lower():
-            return [
-                MemoryCandidate(
-                    text="Future PR reviews should include a release-readiness recommendation.",
-                    scope=MemoryScope.AGENT,
-                    importance=0.6,
-                    metadata={"source": "assistant_review"},
-                )
-            ]
-        return []
+            comment_id = raw_reply.get("comment_id")
+            author = raw_reply.get("author")
+            body = raw_reply.get("body")
+            if isinstance(comment_id, int) and isinstance(author, str) and isinstance(body, str):
+                replies.append(PullRequestReply(comment_id, author, body))
+    return replies
+
+
+def _replies_from_tool_results(results: list[Any]) -> list[PullRequestReply]:
+    tool_outputs = [
+        result.model_dump(mode="json")
+        for result in results
+        if getattr(result, "name", None) == "github.pr_replies"
+        and getattr(result, "status", None) == "ok"
+    ]
+    return _replies_from_tool_outputs(tool_outputs)
 
 
 async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, Any]:
     repo = str(arguments["repo"])
     pr_number = int(arguments["pr_number"])
-    token = secrets["github_token"]
+    token = await github_app_installation_token(secrets)
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -254,20 +149,20 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
             headers=headers,
         )
         pr_response.raise_for_status()
-        files_response = await client.get(
+        pr = pr_response.json()
+        files = await _get_paginated_list(
+            client,
             f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}/files",
             headers=headers,
-            params={"per_page": 100},
+            list_key=None,
         )
-        files_response.raise_for_status()
-        checks_response = await client.get(
-            f"{GITHUB_API}/repos/{repo}/commits/{pr_response.json()['head']['sha']}/check-runs",
+        checks = await _get_paginated_list(
+            client,
+            f"{GITHUB_API}/repos/{repo}/commits/{pr['head']['sha']}/check-runs",
             headers=headers,
-            params={"per_page": 50},
+            list_key="check_runs",
+            tolerate_statuses={403, 404},
         )
-    pr = pr_response.json()
-    files = files_response.json()
-    checks = checks_response.json() if checks_response.status_code == 200 else {"check_runs": []}
     return {
         "repo": repo,
         "number": pr_number,
@@ -278,6 +173,8 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
         "base": pr["base"]["ref"],
         "head": pr["head"]["ref"],
         "body_excerpt": (pr.get("body") or "")[:2_000],
+        "changed_files_total": len(files),
+        "changed_files_truncated": len(files) > MAX_CHANGED_FILES_IN_CONTEXT,
         "changed_files": [
             {
                 "filename": item["filename"],
@@ -286,17 +183,169 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
                 "deletions": item["deletions"],
                 "patch_excerpt": (item.get("patch") or "")[:1_500],
             }
-            for item in files[:40]
+            for item in files[:MAX_CHANGED_FILES_IN_CONTEXT]
         ],
+        "check_runs_total": len(checks),
+        "check_runs_truncated": len(checks) > MAX_CHECK_RUNS_IN_CONTEXT,
         "check_runs": [
             {
                 "name": item.get("name"),
                 "status": item.get("status"),
                 "conclusion": item.get("conclusion"),
             }
-            for item in checks.get("check_runs", [])[:20]
+            for item in checks[:MAX_CHECK_RUNS_IN_CONTEXT]
         ],
     }
+
+
+async def github_pr_comment(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, str]:
+    repo = str(arguments["repo"])
+    pr_number = int(arguments["pr_number"])
+    body = str(arguments["body"])
+    token = await github_app_installation_token(secrets)
+    url = await post_pr_comment(
+        repo=repo,
+        pr_number=pr_number,
+        body=body,
+        token=token,
+    )
+    return {"url": url}
+
+
+async def github_app_installation_token(secrets: dict[str, str]) -> str:
+    app_id = os.environ["HARNESS_GITHUB_APP_ID"]
+    installation_id = os.environ["HARNESS_GITHUB_INSTALLATION_ID"]
+    private_key = _normalize_private_key(secrets["github_app_private_key"])
+    now = int(time.time())
+    app_jwt = jwt.encode(
+        {
+            "iat": now - 60,
+            "exp": now + 540,
+            "iss": app_id,
+        },
+        private_key,
+        algorithm="RS256",
+    )
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {app_jwt}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{GITHUB_API}/app/installations/{installation_id}/access_tokens",
+            headers=headers,
+        )
+    response.raise_for_status()
+    payload = response.json()
+    token = payload.get("token")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("GitHub App installation token response did not include a token.")
+    return token
+
+
+async def fetch_pr_user_replies(
+    *,
+    repo: str,
+    pr_number: int,
+    token: str,
+    app_slug: str | None = None,
+) -> list[PullRequestReply]:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    comments: list[dict[str, Any]] = []
+    async with httpx.AsyncClient(timeout=60) as client:
+        comments = await _get_paginated_list(
+            client,
+            f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
+            headers=headers,
+            list_key=None,
+        )
+    last_agent_index = -1
+    for index, comment in enumerate(comments):
+        body = comment.get("body")
+        if isinstance(body, str) and AGENT_COMMENT_MARKER in body:
+            last_agent_index = index
+    if last_agent_index < 0:
+        return []
+    replies: list[PullRequestReply] = []
+    for comment in comments[last_agent_index + 1:]:
+        body = comment.get("body")
+        user = comment.get("user")
+        comment_id = comment.get("id")
+        if not isinstance(body, str) or AGENT_COMMENT_MARKER in body:
+            continue
+        if not isinstance(user, dict) or not isinstance(user.get("login"), str):
+            continue
+        if not isinstance(comment_id, int):
+            continue
+        if not _is_trusted_reply_author(comment):
+            continue
+        if not _is_addressed_to_bot(body, app_slug=app_slug):
+            continue
+        replies.append(
+            PullRequestReply(
+                comment_id=comment_id,
+                author=user["login"],
+                body=body.strip(),
+            )
+        )
+    return replies
+
+
+def _is_trusted_reply_author(comment: dict[str, Any]) -> bool:
+    association = comment.get("author_association")
+    return association in TRUSTED_REPLY_ASSOCIATIONS
+
+
+def _is_addressed_to_bot(body: str, *, app_slug: str | None = None) -> bool:
+    aliases = {"harness", "harness-pr-review-agent", DEFAULT_APP_SLUG}
+    if app_slug:
+        aliases.add(app_slug.strip().lstrip("@").lower())
+    lowered = body.lower()
+    return any(f"@{alias}" in lowered for alias in aliases if alias)
+
+
+def _reply_payload(reply: PullRequestReply) -> dict[str, Any]:
+    return {
+        "comment_id": reply.comment_id,
+        "author": reply.author,
+        "body": reply.body,
+    }
+
+
+async def _get_paginated_list(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    list_key: str | None,
+    tolerate_statuses: set[int] | None = None,
+) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    tolerated = tolerate_statuses or set()
+    page = 1
+    while True:
+        response = await client.get(
+            url,
+            headers=headers,
+            params={"per_page": GITHUB_PAGE_SIZE, "page": page},
+        )
+        if response.status_code in tolerated:
+            return items
+        response.raise_for_status()
+        payload = response.json()
+        raw_items = payload.get(list_key, []) if list_key else payload
+        if not isinstance(raw_items, list):
+            return items
+        items.extend(item for item in raw_items if isinstance(item, dict))
+        if len(raw_items) < GITHUB_PAGE_SIZE:
+            break
+        page += 1
+    return items
 
 
 def build_registry() -> ToolRegistry:
@@ -307,7 +356,7 @@ def build_registry() -> ToolRegistry:
             description="Fetch real GitHub pull request metadata, changed files, and check runs.",
             execution_mode=ExecutionMode.IN_PROCESS,
             required_capabilities=["github:pr"],
-            required_secrets=["github_token"],
+            required_secrets=["github_app_private_key"],
             input_schema={
                 "type": "object",
                 "required": ["repo", "pr_number"],
@@ -334,7 +383,11 @@ def build_registry() -> ToolRegistry:
                     "title": {"type": "string"},
                     "state": {"type": "string"},
                     "url": {"type": "string"},
+                    "changed_files_total": {"type": "integer"},
+                    "changed_files_truncated": {"type": "boolean"},
                     "changed_files": {"type": "array"},
+                    "check_runs_total": {"type": "integer"},
+                    "check_runs_truncated": {"type": "boolean"},
                     "check_runs": {"type": "array"},
                 },
                 "additionalProperties": True,
@@ -344,64 +397,143 @@ def build_registry() -> ToolRegistry:
     )
     registry.register(
         ToolDefinition(
-            name="repo.project_check",
-            description="Analyze a local repository snapshot inside Docker.",
-            execution_mode=ExecutionMode.CONTAINER,
-            container_schema="python-analysis",
-            container_command=["python", "-c", PROJECT_CHECKER],
-            required_capabilities=["repo:sandbox"],
-            timeout_seconds=30,
+            name="github.pr_comment",
+            description="Post the final review as a GitHub pull request comment.",
+            execution_mode=ExecutionMode.IN_PROCESS,
+            required_capabilities=["github:comment"],
+            required_secrets=["github_app_private_key"],
             input_schema={
                 "type": "object",
-                "required": ["repo_snapshot"],
+                "required": ["repo", "pr_number", "body"],
                 "properties": {
-                    "repo_snapshot": {
-                        "type": "object",
-                        "required": ["root_name", "files", "config_files"],
-                        "properties": {
-                            "root_name": {"type": "string"},
-                            "files": {"type": "array", "items": {"type": "string"}},
-                            "config_files": {
-                                "type": "object",
-                                "additionalProperties": {"type": "string"},
-                            },
-                        },
-                        "additionalProperties": True,
+                    "repo": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                    "body": {
+                        "type": "string",
+                        "description": "Markdown review comment to post to the pull request.",
                     },
                 },
                 "additionalProperties": False,
             },
             output_schema={
                 "type": "object",
-                "required": [
-                    "root_name",
-                    "file_count_sampled",
-                    "top_extensions",
-                    "languages",
-                    "package_managers",
-                    "test_indicators",
-                    "ci_present",
-                    "container_files",
-                    "security_indicators",
-                    "notes",
-                ],
+                "required": ["url"],
+                "properties": {"url": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        github_pr_comment,
+    )
+    registry.register(
+        ToolDefinition(
+            name="repo.bash",
+            description=(
+                "Run a read-only POSIX shell command in the PR checkout mounted at /repo. "
+                "Use this to inspect files, configuration, tests, and code quality signals. "
+                "Available commands include sh, find, grep, sed, head, cat, and python; "
+                "do not assume git, rg, package managers, or network tools are installed."
+            ),
+            execution_mode=ExecutionMode.CONTAINER,
+            container_schema="python-analysis",
+            container_command=["python", "-c", BASH_RUNNER],
+            required_capabilities=["repo:sandbox"],
+            timeout_seconds=30,
+            max_output_bytes=200_000,
+            input_schema={
+                "type": "object",
+                "required": ["command"],
                 "properties": {
-                    "root_name": {"type": "string"},
-                    "file_count_sampled": {"type": "integer"},
-                    "top_extensions": {"type": "array"},
-                    "languages": {"type": "array", "items": {"type": "string"}},
-                    "package_managers": {"type": "array", "items": {"type": "string"}},
-                    "test_indicators": {"type": "array", "items": {"type": "string"}},
-                    "ci_present": {"type": "boolean"},
-                    "container_files": {"type": "array", "items": {"type": "string"}},
-                    "security_indicators": {"type": "array", "items": {"type": "string"}},
-                    "notes": {"type": "array", "items": {"type": "string"}},
+                    "command": {
+                        "type": "string",
+                        "description": "Shell command to run with /repo as the working directory.",
+                    },
+                },
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "required": ["command", "returncode", "stdout", "stderr"],
+                "properties": {
+                    "command": {"type": "string"},
+                    "returncode": {"type": "integer"},
+                    "stdout": {"type": "string"},
+                    "stderr": {"type": "string"},
                 },
                 "additionalProperties": False,
             },
         )
     )
     return registry
+
+
+def register_run_tools(
+    registry: ToolRegistry,
+    *,
+    storage: SQLiteStorage,
+    memory: MemoryManager,
+    session_id: str,
+) -> None:
+    async def github_pr_replies(
+        arguments: dict[str, Any],
+        secrets: dict[str, str],
+    ) -> dict[str, Any]:
+        repo = str(arguments["repo"])
+        pr_number = int(arguments["pr_number"])
+        token = await github_app_installation_token(secrets)
+        app_slug = os.environ.get("HARNESS_GITHUB_APP_SLUG", DEFAULT_APP_SLUG)
+        replies = await _unprocessed_replies(
+            storage,
+            repo=repo,
+            pr_number=pr_number,
+            token=token,
+            app_slug=app_slug,
+        )
+        return {"replies": [_reply_payload(reply) for reply in replies]}
+
+    registry.register(
+        ToolDefinition(
+            name="github.pr_replies",
+            description=(
+                "Read unprocessed user replies on the GitHub PR after the latest Harness "
+                "agent comment. Use this before deciding whether to process review "
+                "preferences or run a fresh review."
+            ),
+            execution_mode=ExecutionMode.IN_PROCESS,
+            required_capabilities=["github:replies"],
+            required_secrets=["github_app_private_key"],
+            input_schema={
+                "type": "object",
+                "required": ["repo", "pr_number"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "required": ["replies"],
+                "properties": {
+                    "replies": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["comment_id", "author", "body"],
+                            "properties": {
+                                "comment_id": {"type": "integer"},
+                                "author": {"type": "string"},
+                                "body": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "additionalProperties": False,
+            },
+        ),
+        github_pr_replies,
+    )
+    register_memory_tools(registry, memory, source_session_id=session_id)
 
 
 async def main() -> None:
@@ -412,42 +544,66 @@ async def main() -> None:
 
     repo = os.environ.get("HARNESS_GITHUB_REPO", "")
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
-    repo_path = _target_repo_path()
+    tool_capabilities = [
+        "github:pr",
+        "github:replies",
+        "github:comment",
+        "memory:write",
+        "repo:sandbox",
+    ]
+    context_max_chars = int(os.environ.get("HARNESS_PR_REVIEW_CONTEXT_MAX_CHARS", "120000"))
+    context_trigger_ratio = float(
+        os.environ.get("HARNESS_PR_REVIEW_COMPACTION_TRIGGER_RATIO", "0.75")
+    )
     settings = HarnessSettings(
         storage_backend="sqlite",
         sqlite_path=DEMO_DB,
         model_provider=os.environ.get("HARNESS_MODEL_PROVIDER", "openai"),
-        openai_model=os.environ.get("HARNESS_OPENAI_MODEL", "gpt-4.1-mini"),
+        openai_model=os.environ.get("HARNESS_OPENAI_MODEL", "gpt-5.2"),
         embedding_provider=os.environ.get("HARNESS_EMBEDDING_PROVIDER", "minilm"),
         memory_enabled=True,
         memory_namespace="github-pr-review-demo",
-        memory_auto_capture=True,
+        memory_auto_capture=False,
         memory_retrieval_limit=4,
         memory_max_context_chars=1_500,
         context_compaction_enabled=True,
-        context_max_chars=18_000,
-        context_compaction_trigger_ratio=0.35,
+        context_max_chars=context_max_chars,
+        context_compaction_trigger_ratio=context_trigger_ratio,
         context_compaction_preserve_recent_messages=4,
         context_compaction_summarizer_input_max_chars=4_000,
         context_compaction_summary_max_chars=800,
         container_cleanup_delay_minutes=5,
-        tool_capabilities=["github:pr", "repo:sandbox"],
+        tool_capabilities=tool_capabilities,
         secret_backend="env",
     )
-    await _preflight(settings, repo=repo, pr_number=pr_number, repo_path=repo_path)
+    await _preflight(settings, repo=repo, pr_number=pr_number)
 
     storage = SQLiteStorage(DEMO_DB)
     await storage.migrate()
     registry = build_registry()
+    review_workspace = tempfile.TemporaryDirectory(prefix="harness-pr-review-")
+    clone_token = await github_app_installation_token(
+        {"github_app_private_key": os.environ["HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"]}
+    )
+    review_repo_path = await asyncio.to_thread(
+        _clone_pr_checkout,
+        repo,
+        pr_number,
+        Path(review_workspace.name),
+        clone_token,
+    )
     schemas = ContainerSchemaRegistry(
         [
             ContainerSchema(
                 name="python-analysis",
                 image="python:3.12-alpine",
+                mount=review_repo_path,
+                workdir="/repo",
                 network=False,
                 read_only_root=True,
+                mount_read_only=True,
                 tmpfs_tmp=True,
-                tmpfs_workdir=True,
+                tmpfs_workdir=False,
                 share_across_tools=True,
             )
         ]
@@ -463,6 +619,7 @@ async def main() -> None:
             ExecutionMode.CONTAINER: DockerContainerExecutor(
                 docker_bin=settings.docker_bin,
                 schemas=schemas,
+                allowed_mount_root=review_repo_path,
             ),
         },
         own_storage=True,
@@ -475,25 +632,31 @@ async def main() -> None:
             raise RuntimeError("This example requires a real model provider.")
         model = runtime.model
         assert runtime.memory is not None
-        runtime.memory.extractor = PullRequestMemoryExtractor()
 
         session = Session(
             metadata={
                 "example": "github_pr_review_agent",
                 "repo": repo,
                 "pr": pr_number,
-                "repo_path": str(repo_path),
+                "repo_path": str(review_repo_path),
             }
         )
         await storage.create_session(session)
+        register_run_tools(
+            registry,
+            storage=storage,
+            memory=runtime.memory,
+            session_id=session.id,
+        )
 
         loop = runtime.agent_loop(
+            max_iterations=int(os.environ.get("HARNESS_PR_REVIEW_MAX_ITERATIONS", "32")),
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
                     enabled=True,
-                    max_context_chars=18_000,
-                    trigger_ratio=0.35,
+                    max_context_chars=context_max_chars,
+                    trigger_ratio=context_trigger_ratio,
                     preserve_recent_messages=4,
                     summarizer_input_max_chars=4_000,
                     summary_max_chars=800,
@@ -502,13 +665,27 @@ async def main() -> None:
         )
         result = await loop.run(
             session.id,
-            _review_prompt(repo=repo, pr_number=pr_number, repo_path=repo_path),
+            _review_prompt(
+                repo=repo,
+                pr_number=pr_number,
+                repo_path=review_repo_path,
+            ),
+        )
+        replies = _replies_from_tool_results(result.tool_results)
+        await _mark_replies_processed(
+            storage,
+            repo=repo,
+            pr_number=pr_number,
+            replies=replies,
         )
 
         turns = await storage.list_turns(session.id, limit=None)
         tool_calls = await storage.list_tool_calls(session.id, limit=None)
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
+        comment_url = _comment_url_from_results(result.tool_results)
+        if not replies and comment_url is None:
+            raise RuntimeError("Review finished without posting a PR comment.")
 
         print(
             json.dumps(
@@ -516,12 +693,14 @@ async def main() -> None:
                     "session_id": session.id,
                     "repo": repo,
                     "pr_number": pr_number,
-                    "repo_path": str(repo_path),
+                    "review_repo_path": str(review_repo_path),
                     "model_provider": settings.model_provider,
                     "embedding_provider": settings.embedding_provider,
                     "final": result.final,
                     "tool_statuses": {call.tool_name: call.status for call in tool_calls},
                     "memory_ids_injected": result.memory_ids,
+                    "comment_url": comment_url,
+                    "reply_comment_ids_processed": [reply.comment_id for reply in replies],
                     "counts": {
                         "turns": len(turns),
                         "tool_calls": len(tool_calls),
@@ -539,23 +718,205 @@ async def main() -> None:
         )
     finally:
         await runtime.close()
+        review_workspace.cleanup()
 
 
-def _review_prompt(*, repo: str, pr_number: int, repo_path: Path) -> str:
-    repo_snapshot = _repo_snapshot(repo_path)
-    repo_snapshot_json = json.dumps(repo_snapshot, indent=2, sort_keys=True)
+async def post_pr_comment(*, repo: str, pr_number: int, body: str, token: str) -> str:
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "Authorization": f"Bearer {token}",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
+            headers=headers,
+            json={"body": _comment_body(body)},
+        )
+    response.raise_for_status()
+    payload = response.json()
+    url = payload.get("html_url")
+    return str(url) if isinstance(url, str) else ""
+
+
+async def _unprocessed_replies(
+    storage: SQLiteStorage,
+    *,
+    repo: str,
+    pr_number: int,
+    token: str,
+    app_slug: str | None = None,
+) -> list[PullRequestReply]:
+    await _ensure_processed_comments_table(storage)
+    replies = await fetch_pr_user_replies(
+        repo=repo,
+        pr_number=pr_number,
+        token=token,
+        app_slug=app_slug,
+    )
+    async with aiosqlite.connect(storage.path) as db:
+        rows = await db.execute_fetchall(
+            """
+            select comment_id from github_pr_review_processed_comments
+            where repo = ? and pr_number = ?
+            """,
+            (repo, pr_number),
+        )
+    processed_ids = {int(row[0]) for row in rows}
+    return [reply for reply in replies if reply.comment_id not in processed_ids]
+
+
+async def _mark_replies_processed(
+    storage: SQLiteStorage,
+    *,
+    repo: str,
+    pr_number: int,
+    replies: list[PullRequestReply],
+) -> None:
+    if not replies:
+        return
+    await _ensure_processed_comments_table(storage)
+    async with aiosqlite.connect(storage.path) as db:
+        await db.executemany(
+            """
+            insert or ignore into github_pr_review_processed_comments (
+              repo, pr_number, comment_id, author, processed_at
+            )
+            values (?, ?, ?, ?, ?)
+            """,
+            [
+                (repo, pr_number, reply.comment_id, reply.author, utc_now().isoformat())
+                for reply in replies
+            ],
+        )
+        await db.commit()
+
+
+async def _ensure_processed_comments_table(storage: SQLiteStorage) -> None:
+    async with aiosqlite.connect(storage.path) as db:
+        await db.execute(
+            """
+            create table if not exists github_pr_review_processed_comments (
+              repo text not null,
+              pr_number integer not null,
+              comment_id integer not null,
+              author text not null,
+              processed_at text not null,
+              primary key (repo, pr_number, comment_id)
+            )
+            """
+        )
+        await db.commit()
+
+
+def _comment_body(review: str) -> str:
     return (
-        "You are a GitHub PR review agent. Produce a concise code review with concrete "
-        "findings, test gaps, and a release-readiness recommendation. Use the harness "
-        "JSON protocol, with no markdown outside the JSON.\n\n"
+        f"{AGENT_COMMENT_MARKER}\n"
+        "### Harness PR Review Agent\n\n"
+        f"{review.strip()}\n\n"
+        "_Posted by the Harness PR review agent._"
+    )
+
+
+def _comment_url_from_results(results: list[Any]) -> str | None:
+    for result in results:
+        if getattr(result, "name", None) != "github.pr_comment" or result.status != "ok":
+            continue
+        output = result.output
+        if isinstance(output, dict) and isinstance(output.get("url"), str):
+            return output["url"]
+    return None
+
+
+def _review_prompt(
+    *,
+    repo: str,
+    pr_number: int,
+    repo_path: Path,
+) -> str:
+    return (
+        "You are a GitHub PR review agent. Review the pull request like a pragmatic "
+        "senior engineer: prioritize correctness, security, data integrity, runtime "
+        "failures, missing tests, and release risk.\n\n"
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
-        f"Local repository root: {repo_path}\n\n"
-        "Recommended first tool batch: call github.pr_context with the repo and PR number "
-        "and repo.project_check with the repo_snapshot below.\n\n"
-        "repo_snapshot:\n"
-        f"{repo_snapshot_json}"
+        f"Cloned PR workspace: {repo_path}\n\n"
+        "Relevant review preferences may already appear in the context above. Treat "
+        "them as standing instructions when they apply to this PR.\n\n"
+        "Start by calling github.pr_replies. If it returns user replies, handle those "
+        "replies before doing anything else. Decide whether each reply contains "
+        "durable review guidance for future runs. For each durable preference, call "
+        "memory.store with concise normalized memory text, scope=agent, and metadata "
+        "containing source=github_pr_comment, github_comment_id, and "
+        "github_comment_author. Ignore thanks, one-off PR facts, current-run findings, and "
+        "requests that are only about the current run. Do not perform a fresh code "
+        "review unless a reply explicitly asks for one; otherwise return a concise "
+        "final answer summarizing what was processed and any memory written.\n\n"
+        "For a fresh review, call github.pr_context to fetch PR metadata, changed "
+        "files, and checks. Then inspect the cloned PR checkout with repo.bash. Use as "
+        "many repo.bash calls as needed to understand the project structure, changed "
+        "code, tests, and likely failure modes. Stop exploring when you have enough "
+        "evidence for a concrete review.\n\n"
+        "repo.bash runs inside Docker with no network and read-only access to the "
+        "cloned PR checkout at /repo. "
+        "Prefer cheap read-only commands such as find, sed, grep, python one-liners, "
+        "and test/config discovery. Do not use git, rg, package "
+        "managers, network access, or commands that write to the repository. If a command "
+        "is unavailable or fails, adapt with simpler POSIX tools.\n\n"
+        "Produce a concise code review with concrete findings, test gaps, and a "
+        "release-readiness recommendation. For fresh reviews, call github.pr_comment "
+        "exactly once to post the review to the pull request, then return the "
+        "detailed review and the comment URL in the final answer."
     )
+
+
+def _normalize_private_key(value: str) -> str:
+    return value.replace("\\n", "\n").strip()
+
+
+def _clone_pr_checkout(repo: str, pr_number: int, target: Path, token: str) -> Path:
+    target.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: Bearer {token}",
+        }
+    )
+    repo_url = f"https://github.com/{repo}.git"
+    _run_git(["git", "init", str(target)], env=env)
+    _run_git(["git", "-C", str(target), "remote", "add", "origin", repo_url], env=env)
+    _run_git(
+        [
+            "git",
+            "-C",
+            str(target),
+            "fetch",
+            "--depth=1",
+            "origin",
+            f"refs/pull/{pr_number}/head",
+        ],
+        env=env,
+    )
+    _run_git(["git", "-C", str(target), "checkout", "--detach", "FETCH_HEAD"], env=env)
+    shutil.rmtree(target / ".git", ignore_errors=True)
+    return target
+
+
+def _run_git(command: list[str], *, env: dict[str, str]) -> None:
+    result = subprocess.run(
+        command,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"Git command failed: {stderr}")
 
 
 async def _preflight(
@@ -563,7 +924,6 @@ async def _preflight(
     *,
     repo: str,
     pr_number: int,
-    repo_path: Path,
 ) -> None:
     if (
         settings.model_provider == "openai" or settings.embedding_provider == "openai"
@@ -579,78 +939,17 @@ async def _preflight(
         raise RuntimeError("Set HARNESS_GITHUB_REPO, for example owner/repository.")
     if pr_number <= 0:
         raise RuntimeError("Set HARNESS_GITHUB_PR to a real pull request number.")
-    if not repo_path.is_dir():
-        raise RuntimeError(f"HARNESS_REPO_PATH must point to a local checkout: {repo_path}")
-    if not os.environ.get("HARNESS_SECRET_GITHUB_TOKEN"):
-        raise RuntimeError("Set HARNESS_SECRET_GITHUB_TOKEN to a real GitHub token.")
+    if not os.environ.get("HARNESS_GITHUB_APP_ID"):
+        raise RuntimeError("Set HARNESS_GITHUB_APP_ID to the GitHub App id.")
+    if not os.environ.get("HARNESS_GITHUB_INSTALLATION_ID"):
+        raise RuntimeError("Set HARNESS_GITHUB_INSTALLATION_ID to the App installation id.")
+    if not os.environ.get("HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"):
+        raise RuntimeError("Set HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY to the App private key.")
     docker = await anyio.run_process([settings.docker_bin, "info"], check=False)
     if docker.returncode != 0:
         raise RuntimeError(
             "Docker is required for the sandboxed tool. Start Docker and rerun this example."
         )
-
-
-def _target_repo_path() -> Path:
-    raw_path = os.environ.get("HARNESS_REPO_PATH")
-    return Path(raw_path).expanduser().resolve() if raw_path else Path.cwd().resolve()
-
-
-def _repo_snapshot(repo_path: Path) -> dict[str, Any]:
-    files = _repo_files(repo_path)
-    return {
-        "root_name": repo_path.name,
-        "files": files[:MAX_REPO_FILES],
-        "config_files": _read_config_files(repo_path, files),
-        "truncated": len(files) > MAX_REPO_FILES,
-    }
-
-
-def _repo_files(repo_path: Path) -> list[str]:
-    git_files = _git_files(repo_path)
-    if git_files:
-        return git_files
-    files: list[str] = []
-    for path in repo_path.rglob("*"):
-        if not path.is_file():
-            continue
-        relative = path.relative_to(repo_path)
-        parts = set(relative.parts)
-        if parts & SKIP_DIRS:
-            continue
-        files.append(relative.as_posix())
-        if len(files) >= MAX_REPO_FILES:
-            break
-    return sorted(files)
-
-
-def _git_files(repo_path: Path) -> list[str]:
-    result = subprocess.run(
-        ["git", "-C", str(repo_path), "ls-files"],
-        check=False,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        return []
-    return sorted(
-        line.strip()
-        for line in result.stdout.decode(errors="replace").splitlines()
-        if line.strip()
-    )
-
-
-def _read_config_files(repo_path: Path, files: list[str]) -> dict[str, str]:
-    configs: dict[str, str] = {}
-    for relative in files:
-        if relative not in CONFIG_FILENAMES and Path(relative).name not in CONFIG_FILENAMES:
-            continue
-        path = (repo_path / relative).resolve()
-        if not path.is_relative_to(repo_path) or not path.is_file():
-            continue
-        try:
-            configs[relative] = path.read_text(errors="replace")[:MAX_CONFIG_CHARS]
-        except OSError:
-            continue
-    return configs
 
 
 def _load_local_env_file(path: Path) -> None:

@@ -131,7 +131,6 @@ class PostgresStorage(StorageBackend):
                   embedding_dimensions integer,
                   metadata jsonb not null,
                   scope text not null,
-                  importance double precision not null,
                   confidence double precision not null,
                   source_session_id text,
                   source_turn_id text,
@@ -200,6 +199,23 @@ class PostgresStorage(StorageBackend):
             created_at=row["created_at"],
             metadata=from_json(row["metadata"], {}),
         )
+
+    async def list_sessions(self, limit: int | None = 100) -> list[Session]:
+        pool = await self._get_pool()
+        query = "select * from sessions order by created_at desc"
+        args: list[int] = []
+        if limit is not None:
+            query += " limit $1"
+            args.append(limit)
+        rows = await pool.fetch(query, *args)
+        return [
+            Session(
+                id=row["id"],
+                created_at=row["created_at"],
+                metadata=from_json(row["metadata"], {}),
+            )
+            for row in rows
+        ]
 
     async def try_acquire_session_lease(
         self,
@@ -497,13 +513,13 @@ class PostgresStorage(StorageBackend):
             """
             insert into memories (
               id, namespace, text, embedding, embedding_provider, embedding_model,
-              embedding_dimensions, metadata, scope, importance,
-              confidence, source_session_id, source_turn_id, updated_at, last_used_at,
-              expires_at, created_at
+              embedding_dimensions, metadata, scope,
+              confidence, source_session_id, source_turn_id, updated_at,
+              last_used_at, expires_at, created_at
             )
             values (
-              $1, $2, $3, $4::jsonb, $5, $6, $7, $8::jsonb, $9, $10, $11, $12,
-              $13, $14, $15, $16, $17
+              $1, $2, $3, $4::jsonb, $5, $6, $7, $8::jsonb, $9, $10,
+              $11, $12, $13, $14, $15, $16
             )
             """,
             memory.id,
@@ -515,7 +531,6 @@ class PostgresStorage(StorageBackend):
             memory.embedding_dimensions,
             to_json(redact(memory.metadata, memory_secrets)),
             memory.scope.value,
-            memory.importance,
             memory.confidence,
             memory.source_session_id,
             memory.source_turn_id,
@@ -556,7 +571,6 @@ class PostgresStorage(StorageBackend):
                 embedding_dimensions=row["embedding_dimensions"],
                 metadata=from_json(row["metadata"], {}),
                 scope=row["scope"],
-                importance=row["importance"],
                 confidence=row["confidence"],
                 source_session_id=row["source_session_id"],
                 source_turn_id=row["source_turn_id"],

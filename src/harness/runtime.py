@@ -66,6 +66,7 @@ class RuntimeContext:
         *,
         model: ModelProvider | None = None,
         context_compactor: ContextCompactor | None = None,
+        max_iterations: int = 8,
     ) -> AgentLoop:
         if model is None:
             model = self.model
@@ -75,6 +76,7 @@ class RuntimeContext:
             model=model,
             tools=self.gateway,
             storage=self.storage,
+            max_iterations=max_iterations,
             container_cleanup_delay_minutes=self.settings.container_cleanup_delay_minutes,
             lease_provider=self.lease_provider,
             memory=self.memory,

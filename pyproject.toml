@@ -17,6 +17,7 @@ dependencies = [
   "nicegui>=2.0",
   "pydantic>=2.7",
   "pydantic-settings>=2.6",
+  "pyjwt[crypto]>=2.8",
 ]
 
 [project.optional-dependencies]

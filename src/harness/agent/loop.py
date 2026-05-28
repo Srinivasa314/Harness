@@ -269,7 +269,6 @@ class AgentLoop:
             await self.storage.save_turn(tool_turn)
             context_boundary_turn_id = tool_turn.id
             messages.append(ModelMessage(role="tool", content=raw_tool_result_content))
-
         final = "Agent stopped before producing a final answer."
         await self.storage.save_turn(
             turn_from_message(
@@ -283,6 +282,13 @@ class AgentLoop:
             "agent.run.stopped",
             session_id=session_id,
             reason="max_iterations",
+        )
+        await self._capture_memory(
+            session_id=session_id,
+            user_message=user_message,
+            assistant_message=final,
+            tool_results=all_tool_results,
+            source_turn_id=user_turn.id,
         )
         return AgentRunResult(
             session_id=session_id,

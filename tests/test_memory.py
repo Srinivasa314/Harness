@@ -14,6 +14,8 @@ from harness.memory import (
 )
 from harness.schemas import MemoryScope
 from harness.storage import SQLiteStorage
+from harness.tools import ToolRegistry
+from harness.tools.memory import register_memory_tools
 
 pytestmark = pytest.mark.anyio
 
@@ -48,7 +50,6 @@ class StaticMemoryExtractor(MemoryExtractor):
             MemoryCandidate(
                 text=f"remembered {exchange.user_message}",
                 scope=MemoryScope.SESSION,
-                importance=0.7,
             )
         ]
 
@@ -111,6 +112,34 @@ async def test_memory_store_accepts_class_based_embedding_provider(tmp_path):
     assert [result.memory.text for result in results] == ["alpha note", "beta note"]
 
 
+async def test_memory_store_tool_writes_generic_memory(tmp_path):
+    storage = await _storage(tmp_path)
+    manager = MemoryManager(
+        MemoryStore(storage, HashEmbeddingProvider()),
+        MemoryPolicy(namespace="project", auto_capture=False),
+    )
+    registry = ToolRegistry()
+    register_memory_tools(registry, manager, source_session_id="session-1")
+
+    result = await registry.function_for("memory.store")(
+        {
+            "text": "Always include migration risk in reviews.",
+            "scope": "agent",
+            "confidence": 0.8,
+            "metadata": {"source": "user_reply"},
+        },
+        {},
+    )
+    [memory] = await storage.list_memories("project")
+
+    assert result == {"memory_id": memory.id}
+    assert memory.text == "Always include migration risk in reviews."
+    assert memory.scope == MemoryScope.AGENT
+    assert memory.confidence == 0.8
+    assert memory.metadata == {"source": "user_reply"}
+    assert memory.source_session_id == "session-1"
+
+
 async def test_memory_store_filters_records_from_other_embedding_config(tmp_path):
     storage = await _storage(tmp_path)
     hash_memory = MemoryStore(storage, HashEmbeddingProvider(dimensions=8))
@@ -132,7 +161,6 @@ async def test_memory_manager_builds_context_with_structured_filters(tmp_path):
     await manager.remember(
         "alpha agent preference",
         scope=MemoryScope.AGENT,
-        importance=0.9,
     )
     await manager.remember(
         "alpha session scratch",

@@ -535,7 +535,8 @@ class DockerContainerExecutor(ToolExecutor):
                 raise ValueError("Container mounts require an allowed mount root")
             if not mount.is_relative_to(self.allowed_mount_root):
                 raise ValueError("Container mount is outside the allowed mount root")
-            command.extend(["-v", f"{mount}:{schema.workdir}:rw"])
+            mode = "ro" if schema.mount_read_only else "rw"
+            command.extend(["-v", f"{mount}:{schema.workdir}:{mode}"])
         command.append(schema.image)
         command.extend(schema.keepalive_command)
         return command

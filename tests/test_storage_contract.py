@@ -42,6 +42,7 @@ async def _exercise_storage_contract(storage: StorageBackend) -> None:
     session = Session(metadata={"suite": "contract"})
     await storage.create_session(session)
     assert (await storage.get_session(session.id)) == session
+    assert (await storage.list_sessions(limit=1))[0] == session
     assert await storage.try_acquire_session_lease(session.id, "owner-a", ttl_seconds=300)
     assert not await storage.try_acquire_session_lease(session.id, "owner-b", ttl_seconds=300)
     await storage.release_session_lease(session.id, "owner-b")
@@ -163,7 +164,6 @@ async def _exercise_storage_contract(storage: StorageBackend) -> None:
         embedding=[1.0],
         metadata={"n": 1},
         scope=MemoryScope.SESSION,
-        importance=0.8,
         confidence=0.9,
         source_session_id=session.id,
     )
@@ -171,7 +171,6 @@ async def _exercise_storage_contract(storage: StorageBackend) -> None:
     memories = await storage.list_memories("project", scopes=[MemoryScope.SESSION])
     assert memories[0].metadata == {"n": 1}
     assert memories[0].scope == MemoryScope.SESSION
-    assert memories[0].importance == 0.8
     assert memories[0].source_session_id == session.id
     await storage.mark_memories_used([memory.id])
     used_memories = await storage.list_memories("project", scopes=[MemoryScope.SESSION])

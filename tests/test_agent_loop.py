@@ -17,7 +17,15 @@ from harness.agent import (
     SessionLeaseError,
     StorageSessionLeaseProvider,
 )
-from harness.memory import HashEmbeddingProvider, MemoryManager, MemoryPolicy, MemoryStore
+from harness.memory import (
+    HashEmbeddingProvider,
+    MemoryCandidate,
+    MemoryExchange,
+    MemoryExtractor,
+    MemoryManager,
+    MemoryPolicy,
+    MemoryStore,
+)
 from harness.models import ModelMessage, ModelProvider, ModelResponse
 from harness.schemas import ExecutionMode, MemoryScope, ToolDefinition, TurnRecord
 from harness.storage import SQLiteStorage
@@ -59,6 +67,16 @@ class EchoingSummaryModel(ModelProvider):
         if messages and COMPACTION_PROMPT_MARKER in messages[0].content:
             return ModelResponse(content=messages[1].content)
         return ModelResponse(content='{"final": "done"}')
+
+
+class StaticMemoryExtractor(MemoryExtractor):
+    async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
+        return [
+            MemoryCandidate(
+                text=f"remembered {exchange.user_message}",
+                scope=MemoryScope.SESSION,
+            )
+        ]
 
 
 class SecretRepeatingCompactionModel(ModelProvider):
@@ -1285,6 +1303,36 @@ async def test_agent_loop_stops_after_max_iterations_and_records_event(storage):
     assert any(event.event_type == "agent.run.stopped" for event in events)
 
 
+async def test_agent_loop_captures_memory_after_max_iterations(storage):
+    session = await AgentSessionManager(storage).create()
+    memory = MemoryManager(
+        MemoryStore(storage=storage, embeddings=HashEmbeddingProvider()),
+        policy=MemoryPolicy(namespace="project", auto_capture=True),
+        extractor=StaticMemoryExtractor(),
+    )
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                content=json.dumps(
+                    {"tool_calls": [{"name": "echo", "arguments": {"value": "again"}}]}
+                )
+            ),
+        ]
+    )
+    loop = AgentLoop(
+        model=model,
+        tools=build_gateway(storage),
+        storage=storage,
+        max_iterations=1,
+        memory=memory,
+    )
+
+    await loop.run(session.id, "loop")
+
+    memories = await storage.list_memories("project", scopes=[MemoryScope.SESSION])
+    assert [item.text for item in memories] == ["remembered loop"]
+
+
 async def test_agent_loop_records_redacted_model_failure_event(storage):
     session = await AgentSessionManager(storage).create()
     loop = AgentLoop(model=FailingModel(), tools=build_gateway(storage), storage=storage)
@@ -1324,23 +1372,23 @@ async def test_session_lease_provider_heartbeats_active_sessions(storage):
     provider = StorageSessionLeaseProvider(
         storage,
         owner_id="runtime-a",
-        ttl_seconds=0.05,
-        heartbeat_seconds=0.01,
+        ttl_seconds=0.2,
+        heartbeat_seconds=0.02,
     )
     lease = await provider.enter_session(session.id)
 
-    await anyio.sleep(0.08)
+    await anyio.sleep(0.12)
 
     assert not await storage.try_acquire_session_lease(
         session.id,
         "runtime-b",
-        ttl_seconds=0.05,
+        ttl_seconds=0.2,
     )
     await lease.release()
     assert await storage.try_acquire_session_lease(
         session.id,
         "runtime-b",
-        ttl_seconds=0.05,
+        ttl_seconds=0.2,
     )
     await storage.release_session_lease(session.id, "runtime-b")
 

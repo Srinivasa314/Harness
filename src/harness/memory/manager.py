@@ -54,10 +54,7 @@ class MemoryContextBuilder:
             if not text or text in seen:
                 continue
             seen.add(text)
-            prefix = (
-                f"- [{memory.scope.value} score={item.score:.3f} "
-                f"importance={memory.importance:.2f}] "
-            )
+            prefix = f"- [{memory.scope.value} score={item.score:.3f}] "
             next_line = f"{prefix}{text}"
             next_content = "\n".join([*lines, next_line])
             if len(next_content) > max_chars:
@@ -73,7 +70,6 @@ class MemoryContextBuilder:
 class MemoryCandidate(BaseModel):
     text: str
     scope: MemoryScope = MemoryScope.SESSION
-    importance: float = Field(default=0.5, ge=0.0, le=1.0)
     confidence: float = Field(default=1.0, ge=0.0, le=1.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
     expires_at: datetime | None = None
@@ -121,7 +117,6 @@ class MemoryManager:
         *,
         namespace: str | None = None,
         scope: MemoryScope = MemoryScope.AGENT,
-        importance: float = 0.5,
         confidence: float = 1.0,
         metadata: dict[str, Any] | None = None,
         source_session_id: str | None = None,
@@ -133,7 +128,6 @@ class MemoryManager:
             text,
             metadata=metadata,
             scope=scope,
-            importance=importance,
             confidence=confidence,
             source_session_id=source_session_id,
             source_turn_id=source_turn_id,
@@ -197,7 +191,6 @@ class MemoryManager:
                     candidate.text,
                     namespace=namespace,
                     scope=candidate.scope,
-                    importance=candidate.importance,
                     confidence=candidate.confidence,
                     metadata=candidate.metadata,
                     source_session_id=exchange.session_id,

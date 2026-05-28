@@ -117,7 +117,6 @@ class SQLiteStorage(StorageBackend):
                   embedding_dimensions integer,
                   metadata text not null,
                   scope text not null,
-                  importance real not null,
                   confidence real not null,
                   source_session_id text,
                   source_turn_id text,
@@ -178,6 +177,24 @@ class SQLiteStorage(StorageBackend):
             created_at=row["created_at"],
             metadata=from_json(row["metadata"], {}),
         )
+
+    async def list_sessions(self, limit: int | None = 100) -> list[Session]:
+        query = "select * from sessions order by created_at desc"
+        args: list[int] = []
+        if limit is not None:
+            query += " limit ?"
+            args.append(limit)
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            rows = await db.execute_fetchall(query, args)
+        return [
+            Session(
+                id=row["id"],
+                created_at=row["created_at"],
+                metadata=from_json(row["metadata"], {}),
+            )
+            for row in rows
+        ]
 
     async def try_acquire_session_lease(
         self,
@@ -465,11 +482,11 @@ class SQLiteStorage(StorageBackend):
                 """
                 insert into memories (
                   id, namespace, text, embedding, embedding_provider, embedding_model,
-                  embedding_dimensions, metadata, scope, importance,
-                  confidence, source_session_id, source_turn_id, updated_at, last_used_at,
-                  expires_at, created_at
+                  embedding_dimensions, metadata, scope,
+                  confidence, source_session_id, source_turn_id, updated_at,
+                  last_used_at, expires_at, created_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory.id,
@@ -481,7 +498,6 @@ class SQLiteStorage(StorageBackend):
                     memory.embedding_dimensions,
                     to_json(redact(memory.metadata, memory_secrets)),
                     memory.scope.value,
-                    memory.importance,
                     memory.confidence,
                     memory.source_session_id,
                     memory.source_turn_id,
@@ -523,7 +539,6 @@ class SQLiteStorage(StorageBackend):
                 embedding_dimensions=row["embedding_dimensions"],
                 metadata=from_json(row["metadata"], {}),
                 scope=row["scope"],
-                importance=row["importance"],
                 confidence=row["confidence"],
                 source_session_id=row["source_session_id"],
                 source_turn_id=row["source_turn_id"],
