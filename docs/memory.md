@@ -72,9 +72,10 @@ Good durable memories are usually stable user preferences, project conventions,
 or facts that should influence future sessions. Avoid storing noisy run facts
 that are only useful for the current task, such as a specific PR's changed-file
 count. Applications can either write memory explicitly through `MemoryManager`
-or expose a constrained memory-writing tool to the agent. The GitHub PR review
-example uses a `memory.remember_preference` tool for owner-addressed PR replies,
-then retrieves those preferences for later PR reviews in the same namespace.
+or expose the generic `memory.store` tool to the agent with the `memory:write`
+capability. The GitHub PR review example uses that tool for owner-addressed PR
+replies, then retrieves those preferences for later PR reviews in the same
+namespace.
 
 ## Compaction
 

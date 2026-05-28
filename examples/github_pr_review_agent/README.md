@@ -82,7 +82,7 @@ agent comment, only from users GitHub marks as repository owners, and only when
 the comment directly mentions the bot, such as `@harness-pr-review-agent`.
 Set `HARNESS_GITHUB_APP_SLUG` if your installed App uses another mention slug.
 When a reply contains reusable review guidance, the agent stores it by calling
-`memory.remember_preference`; relevant stored preferences are later retrieved
+the generic `memory.store` tool; relevant stored preferences are later retrieved
 by Harness memory and injected into model context automatically.
 
 Commenting is done by the agent through the `github.pr_comment` tool after it

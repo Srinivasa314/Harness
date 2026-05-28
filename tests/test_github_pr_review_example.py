@@ -13,6 +13,7 @@ import httpx
 import pytest
 
 from harness.memory import HashEmbeddingProvider, MemoryManager, MemoryPolicy, MemoryStore
+from harness.schemas import MemoryScope
 
 
 def test_github_pr_example_bash_runner_explores_generic_repo(tmp_path: Path) -> None:
@@ -137,7 +138,7 @@ def test_github_pr_example_registers_run_scoped_tools(tmp_path: Path) -> None:
 
     assert definitions["github.pr_replies"].required_capabilities == ["github:replies"]
     assert definitions["github.pr_replies"].required_secrets == ["github_app_private_key"]
-    assert definitions["memory.remember_preference"].required_capabilities == ["memory:write"]
+    assert definitions["memory.store"].required_capabilities == ["memory:write"]
     assert "memory.search" not in definitions
 
 
@@ -155,11 +156,18 @@ async def test_github_pr_example_memory_tool_stores_user_review_preferences(
     registry = module.build_registry()
     module.register_run_tools(registry, storage=storage, memory=memory, session_id="session-1")
 
-    result = await registry.function_for("memory.remember_preference")(
+    result = await registry.function_for("memory.store")(
         {
-            "comment_id": 102,
-            "author": "bob",
-            "preference": "Analyze code read-only and do not run tests because CI handles them.",
+            "text": (
+                "For GitHub PR reviews, user preference: Analyze code read-only "
+                "and do not run tests because CI handles them."
+            ),
+            "scope": "agent",
+            "metadata": {
+                "source": "github_pr_comment",
+                "github_comment_id": 102,
+                "github_comment_author": "bob",
+            },
         },
         {},
     )
@@ -167,7 +175,7 @@ async def test_github_pr_example_memory_tool_stores_user_review_preferences(
 
     assert isinstance(result, dict)
     assert result["memory_id"] == memories[0].id
-    assert memories[0].scope == module.MemoryScope.AGENT
+    assert memories[0].scope == MemoryScope.AGENT
     assert (
         memories[0].text
         == "For GitHub PR reviews, user preference: Analyze code read-only and "

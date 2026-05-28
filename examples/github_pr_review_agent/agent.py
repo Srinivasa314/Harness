@@ -27,13 +27,18 @@ from harness.runtime import build_runtime_async
 from harness.schemas import (
     ContainerSchema,
     ExecutionMode,
-    MemoryScope,
     Session,
     ToolDefinition,
     utc_now,
 )
 from harness.storage import SQLiteStorage
-from harness.tools import CapabilityGrant, CapabilityPolicy, EnvSecretResolver, ToolRegistry
+from harness.tools import (
+    CapabilityGrant,
+    CapabilityPolicy,
+    EnvSecretResolver,
+    ToolRegistry,
+)
+from harness.tools.memory import register_memory_tools
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO_DB = ROOT / "data" / "github_pr_review_agent.sqlite3"
@@ -485,28 +490,6 @@ def register_run_tools(
         )
         return {"replies": [_reply_payload(reply) for reply in replies]}
 
-    async def memory_remember_preference(
-        arguments: dict[str, Any],
-        secrets: dict[str, str],
-    ) -> dict[str, str]:
-        _ = secrets
-        comment_id = int(arguments["comment_id"])
-        author = str(arguments["author"])
-        preference = str(arguments["preference"]).strip()
-        if not preference:
-            raise ValueError("preference must not be empty")
-        record = await memory.remember(
-            f"For GitHub PR reviews, user preference: {preference}",
-            scope=MemoryScope.AGENT,
-            metadata={
-                "source": "github_pr_comment",
-                "github_comment_id": comment_id,
-                "github_comment_author": author,
-            },
-            source_session_id=session_id,
-        )
-        return {"memory_id": record.id}
-
     registry.register(
         ToolDefinition(
             name="github.pr_replies",
@@ -550,39 +533,7 @@ def register_run_tools(
         ),
         github_pr_replies,
     )
-    registry.register(
-        ToolDefinition(
-            name="memory.remember_preference",
-            description=(
-                "Store a durable GitHub PR review preference from a directly addressed "
-                "owner reply. Use this only for reusable standing guidance, review style "
-                "preferences, or project review policy; do not store thanks, one-off PR "
-                "facts, or current-run findings."
-            ),
-            execution_mode=ExecutionMode.IN_PROCESS,
-            required_capabilities=["memory:write"],
-            input_schema={
-                "type": "object",
-                "required": ["comment_id", "author", "preference"],
-                "properties": {
-                    "comment_id": {"type": "integer"},
-                    "author": {"type": "string"},
-                    "preference": {
-                        "type": "string",
-                        "description": "Concise durable guidance for future PR reviews.",
-                    },
-                },
-                "additionalProperties": False,
-            },
-            output_schema={
-                "type": "object",
-                "required": ["memory_id"],
-                "properties": {"memory_id": {"type": "string"}},
-                "additionalProperties": False,
-            },
-        ),
-        memory_remember_preference,
-    )
+    register_memory_tools(registry, memory, source_session_id=session_id)
 
 
 async def main() -> None:
@@ -893,8 +844,9 @@ def _review_prompt(
         "Start by calling github.pr_replies. If it returns user replies, handle those "
         "replies before doing anything else. Decide whether each reply contains "
         "durable review guidance for future runs. For each durable preference, call "
-        "memory.remember_preference with a concise normalized preference and the reply "
-        "comment metadata. Ignore thanks, one-off PR facts, current-run findings, and "
+        "memory.store with concise normalized memory text, scope=agent, and metadata "
+        "containing source=github_pr_comment, github_comment_id, and "
+        "github_comment_author. Ignore thanks, one-off PR facts, current-run findings, and "
         "requests that are only about the current run. Do not perform a fresh code "
         "review unless a reply explicitly asks for one; otherwise return a concise "
         "final answer summarizing what was processed and any memory written.\n\n"
