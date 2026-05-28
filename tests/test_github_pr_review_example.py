@@ -61,6 +61,26 @@ def test_github_pr_example_bash_runner_reports_nonzero_exit(tmp_path: Path) -> N
     assert "missing-file" in result["stderr"]
 
 
+def test_github_pr_example_bash_runner_reports_timeout_with_output() -> None:
+    module = _load_example_module()
+    runner = module.BASH_RUNNER.replace("timeout=25", "timeout=0.01")
+    payload = {"arguments": {"command": "printf hello; sleep 1"}}
+
+    completed = subprocess.run(
+        [sys.executable, "-c", runner],
+        input=json.dumps(payload),
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+
+    result = json.loads(completed.stdout)
+
+    assert result["returncode"] == 124
+    assert result["stdout"] == "hello"
+    assert "timed out" in result["stderr"]
+
+
 def test_github_pr_example_prepares_tracked_file_workspace(tmp_path: Path) -> None:
     module = _load_example_module()
     repo = _generic_repo(tmp_path)
@@ -237,7 +257,7 @@ async def test_github_pr_example_fetches_user_replies_after_last_agent_comment(
                     "id": 5,
                     "body": "Always include rollout risk.",
                     "user": {"login": "bob"},
-                    "author_association": "MEMBER",
+                    "author_association": "OWNER",
                 },
                 {
                     "id": 6,
@@ -350,7 +370,7 @@ async def test_github_pr_example_paginates_github_lists() -> None:
         page = int(request.url.params.get("page", "1"))
         per_page = int(request.url.params.get("per_page", "100"))
         if str(request.url).startswith("https://api.github.test/files"):
-            count = per_page if page == 1 else 2
+            count = per_page if page in {1, 2, 3, 4, 5} else 2
             return httpx.Response(
                 200,
                 json=[
@@ -390,8 +410,8 @@ async def test_github_pr_example_paginates_github_lists() -> None:
             list_key="check_runs",
         )
 
-    assert len(files) == module.GITHUB_PAGE_SIZE + 2
-    assert files[-1]["filename"] == "file-2-1.py"
+    assert len(files) == module.GITHUB_PAGE_SIZE * 5 + 2
+    assert files[-1]["filename"] == "file-6-1.py"
     assert len(checks) == module.GITHUB_PAGE_SIZE + 1
     assert checks[-1]["name"] == "check-2-0"
 
@@ -448,7 +468,6 @@ async def test_github_pr_example_posts_agent_comment(monkeypatch: pytest.MonkeyP
             repo="owner/repo",
             pr_number=7,
             token="secret-token",
-            review="Release-ready.",
         )
     finally:
         await client.aclose()
@@ -458,7 +477,7 @@ async def test_github_pr_example_posts_agent_comment(monkeypatch: pytest.MonkeyP
     assert captured["authorization"] == "Bearer secret-token"
     assert isinstance(captured["payload"], dict)
     assert "Harness PR Review Agent" in str(captured["payload"]["body"])
-    assert "Release-ready." in str(captured["payload"]["body"])
+    assert module.PUBLIC_COMMENT_BODY in str(captured["payload"]["body"])
 
 
 @pytest.mark.anyio
@@ -508,13 +527,11 @@ async def test_github_pr_example_comment_tool_uses_github_app_token(
         repo: str,
         pr_number: int,
         token: str,
-        review: str,
     ) -> str:
         captured["comment"] = {
             "repo": repo,
             "pr_number": pr_number,
             "token": token,
-            "review": review,
         }
         return "https://github.test/comment"
 
@@ -532,7 +549,6 @@ async def test_github_pr_example_comment_tool_uses_github_app_token(
         "repo": "owner/repo",
         "pr_number": 7,
         "token": "installation-token",
-        "review": "Ready.",
     }
 
 

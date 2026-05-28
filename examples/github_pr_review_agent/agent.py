@@ -34,7 +34,6 @@ from harness.schemas import (
 )
 from harness.storage import SQLiteStorage
 from harness.tools import CapabilityGrant, CapabilityPolicy, EnvSecretResolver, ToolRegistry
-from harness.tools.redaction import redact_with_detected_secrets
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO_DB = ROOT / "data" / "github_pr_review_agent.sqlite3"
@@ -43,10 +42,13 @@ ST_CACHE = ROOT / "data" / "sentence-transformers"
 GITHUB_API = "https://api.github.com"
 AGENT_COMMENT_MARKER = "<!-- harness-pr-review-agent -->"
 GITHUB_PAGE_SIZE = 100
-MAX_GITHUB_PAGES = 5
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
-TRUSTED_REPLY_ASSOCIATIONS = {"MEMBER", "OWNER"}
+TRUSTED_REPLY_ASSOCIATIONS = {"OWNER"}
+PUBLIC_COMMENT_BODY = (
+    "Review completed by the Harness PR review agent. See the local run output "
+    "and dashboard for the detailed review."
+)
 PREFERENCE_MARKERS = (
     "always",
     "avoid",
@@ -88,11 +90,17 @@ try:
         timeout=25,
     )
 except subprocess.TimeoutExpired as exc:
+    stdout = exc.stdout or ""
+    stderr = exc.stderr or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode(errors="replace")
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode(errors="replace")
     print(json.dumps({
         "command": command,
         "returncode": 124,
-        "stdout": (exc.stdout or "")[-20000:],
-        "stderr": ((exc.stderr or "") + "\nCommand timed out after 25 seconds.")[-12000:],
+        "stdout": stdout[-20000:],
+        "stderr": (stderr + "\nCommand timed out after 25 seconds.")[-12000:],
     }))
     raise SystemExit(0)
 print(json.dumps({
@@ -297,13 +305,12 @@ async def github_pr_context(arguments: dict[str, Any], secrets: dict[str, str]) 
 async def github_pr_comment(arguments: dict[str, Any], secrets: dict[str, str]) -> dict[str, str]:
     repo = str(arguments["repo"])
     pr_number = int(arguments["pr_number"])
-    body = str(arguments["body"])
+    _ = arguments.get("body")
     token = await github_app_installation_token(secrets)
     url = await post_pr_comment(
         repo=repo,
         pr_number=pr_number,
         token=token,
-        review=body,
     )
     return {"url": url}
 
@@ -405,7 +412,8 @@ async def _get_paginated_list(
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
     tolerated = tolerate_statuses or set()
-    for page in range(1, MAX_GITHUB_PAGES + 1):
+    page = 1
+    while True:
         response = await client.get(
             url,
             headers=headers,
@@ -421,6 +429,7 @@ async def _get_paginated_list(
         items.extend(item for item in raw_items if isinstance(item, dict))
         if len(raw_items) < GITHUB_PAGE_SIZE:
             break
+        page += 1
     return items
 
 
@@ -478,15 +487,21 @@ def build_registry() -> ToolRegistry:
             execution_mode=ExecutionMode.IN_PROCESS,
             required_capabilities=["github:comment"],
             required_secrets=["github_app_private_key"],
-            input_schema={
-                "type": "object",
-                "required": ["repo", "pr_number", "body"],
-                "properties": {
-                    "repo": {"type": "string"},
-                    "pr_number": {"type": "integer"},
-                    "body": {"type": "string"},
-                },
-                "additionalProperties": False,
+                input_schema={
+                    "type": "object",
+                    "required": ["repo", "pr_number"],
+                    "properties": {
+                        "repo": {"type": "string"},
+                        "pr_number": {"type": "integer"},
+                        "body": {
+                            "type": "string",
+                            "description": (
+                                "Ignored. The public GitHub comment body is fixed by "
+                                "the tool to avoid posting model-controlled content."
+                            ),
+                        },
+                    },
+                    "additionalProperties": False,
             },
             output_schema={
                 "type": "object",
@@ -772,13 +787,13 @@ async def main() -> None:
         review_workspace.cleanup()
 
 
-async def post_pr_comment(*, repo: str, pr_number: int, token: str, review: str) -> str:
+async def post_pr_comment(*, repo: str, pr_number: int, token: str) -> str:
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    body = _comment_body(str(redact_with_detected_secrets(review)))
+    body = _comment_body(PUBLIC_COMMENT_BODY)
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
@@ -906,9 +921,9 @@ def _review_prompt(
         "managers, network access, or commands that write to the repository. If a command "
         "is unavailable or fails, adapt with simpler POSIX tools.\n\n"
         "Produce a concise code review with concrete findings, test gaps, and a "
-        "release-readiness recommendation. For fresh reviews, post the review with "
-        "github.pr_comment exactly once, then return a final answer that includes "
-        "the comment URL."
+        "release-readiness recommendation. For fresh reviews, call github.pr_comment "
+        "exactly once to post the fixed public completion marker, then return the "
+        "detailed review and the comment URL in the final answer."
     )
 
 

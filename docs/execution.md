@@ -75,8 +75,8 @@ Schema responsibilities:
 
 Restrictive defaults include no network, dropped Linux capabilities,
 `no-new-privileges`, resource limits, read-only root, temporary `/tmp`, and
-validated read-only mounts. Schemas can opt into writable mounts with
-`mount_read_only=false` when the application explicitly needs that behavior.
+validated mounts. Mounts are writable by default for compatibility; set
+`mount_read_only=true` when a tool only needs read access.
 
 ## Container Lifecycle
 

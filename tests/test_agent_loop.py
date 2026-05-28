@@ -17,7 +17,15 @@ from harness.agent import (
     SessionLeaseError,
     StorageSessionLeaseProvider,
 )
-from harness.memory import HashEmbeddingProvider, MemoryManager, MemoryPolicy, MemoryStore
+from harness.memory import (
+    HashEmbeddingProvider,
+    MemoryCandidate,
+    MemoryExchange,
+    MemoryExtractor,
+    MemoryManager,
+    MemoryPolicy,
+    MemoryStore,
+)
 from harness.models import ModelMessage, ModelProvider, ModelResponse
 from harness.schemas import ExecutionMode, MemoryScope, ToolDefinition, TurnRecord
 from harness.storage import SQLiteStorage
@@ -59,6 +67,16 @@ class EchoingSummaryModel(ModelProvider):
         if messages and COMPACTION_PROMPT_MARKER in messages[0].content:
             return ModelResponse(content=messages[1].content)
         return ModelResponse(content='{"final": "done"}')
+
+
+class StaticMemoryExtractor(MemoryExtractor):
+    async def extract(self, exchange: MemoryExchange) -> list[MemoryCandidate]:
+        return [
+            MemoryCandidate(
+                text=f"remembered {exchange.user_message}",
+                scope=MemoryScope.SESSION,
+            )
+        ]
 
 
 class SecretRepeatingCompactionModel(ModelProvider):
@@ -1283,6 +1301,36 @@ async def test_agent_loop_stops_after_max_iterations_and_records_event(storage):
     assert result.final == "Agent stopped before producing a final answer."
     events = await storage.list_events(session_id=session.id, limit=20)
     assert any(event.event_type == "agent.run.stopped" for event in events)
+
+
+async def test_agent_loop_captures_memory_after_max_iterations(storage):
+    session = await AgentSessionManager(storage).create()
+    memory = MemoryManager(
+        MemoryStore(storage=storage, embeddings=HashEmbeddingProvider()),
+        policy=MemoryPolicy(namespace="project", auto_capture=True),
+        extractor=StaticMemoryExtractor(),
+    )
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                content=json.dumps(
+                    {"tool_calls": [{"name": "echo", "arguments": {"value": "again"}}]}
+                )
+            ),
+        ]
+    )
+    loop = AgentLoop(
+        model=model,
+        tools=build_gateway(storage),
+        storage=storage,
+        max_iterations=1,
+        memory=memory,
+    )
+
+    await loop.run(session.id, "loop")
+
+    memories = await storage.list_memories("project", scopes=[MemoryScope.SESSION])
+    assert [item.text for item in memories] == ["remembered loop"]
 
 
 async def test_agent_loop_records_redacted_model_failure_event(storage):

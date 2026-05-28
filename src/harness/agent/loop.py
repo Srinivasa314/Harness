@@ -283,6 +283,13 @@ class AgentLoop:
             session_id=session_id,
             reason="max_iterations",
         )
+        await self._capture_memory(
+            session_id=session_id,
+            user_message=user_message,
+            assistant_message=final,
+            tool_results=all_tool_results,
+            source_turn_id=user_turn.id,
+        )
         return AgentRunResult(
             session_id=session_id,
             final=final,
