@@ -71,14 +71,7 @@ provides continuity across runs. The agent reads unread PR replies through the
 `github.pr_replies` tool; relevant stored preferences are retrieved by Harness
 memory and injected into model context automatically.
 
-To post the review as a PR comment:
-
-```bash
-export HARNESS_GITHUB_COMMENT=1
-```
-
-When enabled, commenting is done by the agent through the `github.pr_comment`
-tool after it has run `github.pr_context` and explored the checkout with
-`repo.bash`.
+Commenting is done by the agent through the `github.pr_comment` tool after it
+has run `github.pr_context` and explored the checkout with `repo.bash`.
 GitHub shows the comment author as the installed GitHub App. The comment body is
 also marked as coming from the Harness PR review agent.

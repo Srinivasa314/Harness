@@ -61,20 +61,15 @@ def test_github_pr_example_bash_runner_reports_nonzero_exit(tmp_path: Path) -> N
     assert "missing-file" in result["stderr"]
 
 
-def test_github_pr_example_comment_tool_is_optional() -> None:
+def test_github_pr_example_registers_comment_tool() -> None:
     module = _load_example_module()
 
-    without_comment = module.build_registry(enable_comment_tool=False)
-    with_comment = module.build_registry(enable_comment_tool=True)
-    without_comment_names = {
-        definition.name for definition in without_comment.list_definitions()
-    }
-    with_comment_names = {definition.name for definition in with_comment.list_definitions()}
+    registry = module.build_registry()
+    names = {definition.name for definition in registry.list_definitions()}
 
-    assert "github.pr_comment" not in without_comment_names
-    assert "github.pr_comment" in with_comment_names
-    assert "repo.bash" in with_comment_names
-    definitions = {definition.name: definition for definition in with_comment.list_definitions()}
+    assert "github.pr_comment" in names
+    assert "repo.bash" in names
+    definitions = {definition.name: definition for definition in registry.list_definitions()}
     pr_context = definitions["github.pr_context"]
     pr_comment = definitions["github.pr_comment"]
     assert pr_context.required_secrets == ["github_app_private_key"]
@@ -83,7 +78,7 @@ def test_github_pr_example_comment_tool_is_optional() -> None:
 
 def test_github_pr_example_registers_run_scoped_tools(tmp_path: Path) -> None:
     module = _load_example_module()
-    registry = module.build_registry(enable_comment_tool=False)
+    registry = module.build_registry()
     storage = module.SQLiteStorage(tmp_path / "example.sqlite3")
 
     module.register_run_tools(registry, storage=storage)

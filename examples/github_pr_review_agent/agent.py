@@ -412,7 +412,7 @@ async def _get_paginated_list(
     return items
 
 
-def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
+def build_registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
         ToolDefinition(
@@ -459,33 +459,32 @@ def build_registry(*, enable_comment_tool: bool) -> ToolRegistry:
         ),
         github_pr_context,
     )
-    if enable_comment_tool:
-        registry.register(
-            ToolDefinition(
-                name="github.pr_comment",
-                description="Post the final review as a GitHub pull request comment.",
-                execution_mode=ExecutionMode.IN_PROCESS,
-                required_capabilities=["github:comment"],
-                required_secrets=["github_app_private_key"],
-                input_schema={
-                    "type": "object",
-                    "required": ["repo", "pr_number", "body"],
-                    "properties": {
-                        "repo": {"type": "string"},
-                        "pr_number": {"type": "integer"},
-                        "body": {"type": "string"},
-                    },
-                    "additionalProperties": False,
+    registry.register(
+        ToolDefinition(
+            name="github.pr_comment",
+            description="Post the final review as a GitHub pull request comment.",
+            execution_mode=ExecutionMode.IN_PROCESS,
+            required_capabilities=["github:comment"],
+            required_secrets=["github_app_private_key"],
+            input_schema={
+                "type": "object",
+                "required": ["repo", "pr_number", "body"],
+                "properties": {
+                    "repo": {"type": "string"},
+                    "pr_number": {"type": "integer"},
+                    "body": {"type": "string"},
                 },
-                output_schema={
-                    "type": "object",
-                    "required": ["url"],
-                    "properties": {"url": {"type": "string"}},
-                    "additionalProperties": False,
-                },
-            ),
-            github_pr_comment,
-        )
+                "additionalProperties": False,
+            },
+            output_schema={
+                "type": "object",
+                "required": ["url"],
+                "properties": {"url": {"type": "string"}},
+                "additionalProperties": False,
+            },
+        ),
+        github_pr_comment,
+    )
     registry.register(
         ToolDefinition(
             name="repo.bash",
@@ -602,10 +601,7 @@ async def main() -> None:
     repo = os.environ.get("HARNESS_GITHUB_REPO", "")
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
     repo_path = _target_repo_path()
-    comment_enabled = _comment_enabled()
-    tool_capabilities = ["github:pr", "github:replies", "repo:sandbox"]
-    if comment_enabled:
-        tool_capabilities.append("github:comment")
+    tool_capabilities = ["github:pr", "github:replies", "github:comment", "repo:sandbox"]
     settings = HarnessSettings(
         storage_backend="sqlite",
         sqlite_path=DEMO_DB,
@@ -631,7 +627,7 @@ async def main() -> None:
 
     storage = SQLiteStorage(DEMO_DB)
     await storage.migrate()
-    registry = build_registry(enable_comment_tool=comment_enabled)
+    registry = build_registry()
     schemas = ContainerSchemaRegistry(
         [
             ContainerSchema(
@@ -686,7 +682,7 @@ async def main() -> None:
 
         loop = runtime.agent_loop(
             max_iterations=int(os.environ.get("HARNESS_PR_REVIEW_MAX_ITERATIONS", "32")),
-            stop_after_tools={"github.pr_comment"} if comment_enabled else None,
+            stop_after_tools={"github.pr_comment"},
             context_compactor=RollingSummaryContextCompactor(
                 model,
                 ContextCompactionPolicy(
@@ -705,7 +701,6 @@ async def main() -> None:
                 repo=repo,
                 pr_number=pr_number,
                 repo_path=repo_path,
-                comment_enabled=comment_enabled,
             ),
         )
         replies = _replies_from_tool_results(result.tool_results)
@@ -721,7 +716,7 @@ async def main() -> None:
         events = await storage.list_events(session.id, limit=None)
         memories = await storage.list_memories("github-pr-review-demo")
         comment_url = _comment_url_from_results(result.tool_results)
-        if comment_enabled and not replies and comment_url is None:
+        if not replies and comment_url is None:
             raise RuntimeError("Review finished without posting a PR comment.")
 
         print(
@@ -849,14 +844,6 @@ def _comment_body(review: str) -> str:
     )
 
 
-def _comment_enabled() -> bool:
-    return os.environ.get("HARNESS_GITHUB_COMMENT", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-    }
-
-
 def _comment_url_from_results(results: list[Any]) -> str | None:
     for result in results:
         if getattr(result, "name", None) != "github.pr_comment" or result.status != "ok":
@@ -872,19 +859,11 @@ def _review_prompt(
     repo: str,
     pr_number: int,
     repo_path: Path,
-    comment_enabled: bool,
 ) -> str:
-    comment_instruction = (
-        "After drafting the review, call github.pr_comment with the exact review body. "
-        "After the comment tool succeeds, return a final answer that includes the comment URL."
-        if comment_enabled
-        else "Do not post a PR comment in this run; return the review as the final answer."
-    )
     return (
         "You are a GitHub PR review agent. Review the pull request like a pragmatic "
         "senior engineer: prioritize correctness, security, data integrity, runtime "
-        "failures, missing tests, and release risk. Use the harness JSON protocol, "
-        "with no markdown outside the JSON.\n\n"
+        "failures, missing tests, and release risk.\n\n"
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
         f"Local repository root: {repo_path}\n\n"
@@ -902,23 +881,15 @@ def _review_prompt(
         "evidence for a concrete review.\n\n"
         "repo.bash runs inside Docker with no network and read-only access to the "
         "local checkout at /repo. "
-        "A repo.bash tool call must be shaped exactly like "
-        "{\"tool_calls\":[{\"name\":\"repo.bash\",\"arguments\":{\"command\":"
-        "\"find . -maxdepth 2 \\( -path './.git' -o -path './.venv' -o "
-        "-path './data' -o -name '.env*' -o -name '*cache*' \\) -prune -o "
-        "-type f -print | sort | head -80\"}}]}. "
         "Prefer cheap read-only commands such as find, sed, grep, python one-liners, "
         "and test/config discovery. Do not inspect .env*, .git, .venv, data, dist, local "
         "caches, credential files, or secret-looking files. Do not use git, rg, package "
         "managers, network access, or commands that write to the repository. If a command "
         "is unavailable or fails, adapt with simpler POSIX tools.\n\n"
         "Produce a concise code review with concrete findings, test gaps, and a "
-        "release-readiness recommendation. If commenting is enabled, call "
-        "github.pr_comment exactly once before the final answer, "
-        "shaped exactly like "
-        "{\"tool_calls\":[{\"name\":\"github.pr_comment\",\"arguments\":"
-        "{\"repo\":\"owner/name\",\"pr_number\":1,\"body\":\"review text\"}}]}.\n\n"
-        f"{comment_instruction}"
+        "release-readiness recommendation. For fresh reviews, post the review with "
+        "github.pr_comment exactly once, then return a final answer that includes "
+        "the comment URL."
     )
 
 
