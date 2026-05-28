@@ -45,6 +45,7 @@ GITHUB_PAGE_SIZE = 100
 MAX_CHANGED_FILES_IN_CONTEXT = 80
 MAX_CHECK_RUNS_IN_CONTEXT = 50
 TRUSTED_REPLY_ASSOCIATIONS = {"OWNER"}
+DEFAULT_APP_SLUG = "harness-pr-review-agent"
 PREFERENCE_MARKERS = (
     "always",
     "avoid",
@@ -344,7 +345,13 @@ async def github_app_installation_token(secrets: dict[str, str]) -> str:
     return token
 
 
-async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> list[PullRequestReply]:
+async def fetch_pr_user_replies(
+    *,
+    repo: str,
+    pr_number: int,
+    token: str,
+    app_slug: str | None = None,
+) -> list[PullRequestReply]:
     headers = {
         "Accept": "application/vnd.github+json",
         "Authorization": f"Bearer {token}",
@@ -378,6 +385,8 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
             continue
         if not _is_trusted_reply_author(comment):
             continue
+        if not _is_addressed_to_bot(body, app_slug=app_slug):
+            continue
         replies.append(
             PullRequestReply(
                 comment_id=comment_id,
@@ -391,6 +400,14 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
 def _is_trusted_reply_author(comment: dict[str, Any]) -> bool:
     association = comment.get("author_association")
     return association in TRUSTED_REPLY_ASSOCIATIONS
+
+
+def _is_addressed_to_bot(body: str, *, app_slug: str | None = None) -> bool:
+    aliases = {"harness", "harness-pr-review-agent", DEFAULT_APP_SLUG}
+    if app_slug:
+        aliases.add(app_slug.strip().lstrip("@").lower())
+    lowered = body.lower()
+    return any(f"@{alias}" in lowered for alias in aliases if alias)
 
 
 def _reply_payload(reply: PullRequestReply) -> dict[str, Any]:
@@ -562,11 +579,13 @@ def register_run_tools(
         repo = str(arguments["repo"])
         pr_number = int(arguments["pr_number"])
         token = await github_app_installation_token(secrets)
+        app_slug = os.environ.get("HARNESS_GITHUB_APP_SLUG", DEFAULT_APP_SLUG)
         replies = await _unprocessed_replies(
             storage,
             repo=repo,
             pr_number=pr_number,
             token=token,
+            app_slug=app_slug,
         )
         return {"replies": [_reply_payload(reply) for reply in replies]}
 
@@ -812,9 +831,15 @@ async def _unprocessed_replies(
     repo: str,
     pr_number: int,
     token: str,
+    app_slug: str | None = None,
 ) -> list[PullRequestReply]:
     await _ensure_processed_comments_table(storage)
-    replies = await fetch_pr_user_replies(repo=repo, pr_number=pr_number, token=token)
+    replies = await fetch_pr_user_replies(
+        repo=repo,
+        pr_number=pr_number,
+        token=token,
+        app_slug=app_slug,
+    )
     async with aiosqlite.connect(storage.path) as db:
         rows = await db.execute_fetchall(
             """

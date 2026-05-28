@@ -290,7 +290,7 @@ async def test_github_pr_example_fetches_user_replies_after_last_agent_comment(
                 },
                 {
                     "id": 5,
-                    "body": "Always include rollout risk.",
+                    "body": "@review-app Always include rollout risk.",
                     "user": {"login": "bob"},
                     "author_association": "OWNER",
                 },
@@ -312,6 +312,7 @@ async def test_github_pr_example_fetches_user_replies_after_last_agent_comment(
             repo="owner/repo",
             pr_number=7,
             token="installation-token",
+            app_slug="review-app",
         )
     finally:
         await client.aclose()
@@ -320,9 +321,52 @@ async def test_github_pr_example_fetches_user_replies_after_last_agent_comment(
         module.PullRequestReply(
             comment_id=5,
             author="bob",
-            body="Always include rollout risk.",
+            body="@review-app Always include rollout risk.",
         )
     ]
+
+
+@pytest.mark.anyio
+async def test_github_pr_example_ignores_owner_replies_not_addressed_to_bot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_example_module()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url).startswith("https://api.github.test/repos/owner/repo")
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": 1,
+                    "body": f"{module.AGENT_COMMENT_MARKER}\nAgent review",
+                    "user": {"login": "review-app"},
+                    "author_association": "MEMBER",
+                },
+                {
+                    "id": 2,
+                    "body": "Always include rollout risk.",
+                    "user": {"login": "bob"},
+                    "author_association": "OWNER",
+                },
+            ],
+        )
+
+    monkeypatch.setattr(module, "GITHUB_API", "https://api.github.test")
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda *args, **kwargs: client)
+
+    try:
+        replies = await module.fetch_pr_user_replies(
+            repo="owner/repo",
+            pr_number=7,
+            token="installation-token",
+            app_slug="review-app",
+        )
+    finally:
+        await client.aclose()
+
+    assert replies == []
 
 
 @pytest.mark.anyio
@@ -381,10 +425,12 @@ async def test_github_pr_example_filters_already_processed_replies(
         repo: str,
         pr_number: int,
         token: str,
+        app_slug: str | None = None,
     ) -> list[Any]:
         assert repo == "owner/repo"
         assert pr_number == 7
         assert token == "installation-token"
+        assert app_slug is None
         return [
             module.PullRequestReply(3, "alice", "Prefer tests."),
             module.PullRequestReply(4, "bob", "Always include migration risk."),
