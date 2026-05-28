@@ -125,11 +125,11 @@ main end-to-end example. It reviews a real pull request using:
 - a credentialized GitHub comment tool;
 - context compaction and dashboard observability.
 
-It is intentionally generic: the agent copies git-tracked files from a local PR
-checkout into a temporary review workspace, explores that workspace with shell
-commands inside the configured container, reads directly addressed review
-instructions from PR comments, stores durable preferences through the framework
-memory tool, and posts its review through a tool call.
+It is intentionally generic: the agent clones the PR into a temporary review
+workspace, explores that workspace with shell commands inside the configured
+container, reads directly addressed review instructions from PR comments, stores
+durable preferences through the framework memory tool, and posts its review
+through a tool call.
 
 ## Configuration
 

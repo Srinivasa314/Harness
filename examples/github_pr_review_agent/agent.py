@@ -428,7 +428,7 @@ def build_registry() -> ToolRegistry:
         ToolDefinition(
             name="repo.bash",
             description=(
-                "Run a read-only POSIX shell command in the local checkout mounted at /repo. "
+                "Run a read-only POSIX shell command in the PR checkout mounted at /repo. "
                 "Use this to inspect files, configuration, tests, and code quality signals. "
                 "Available commands include sh, find, grep, sed, head, cat, and python; "
                 "do not assume git, rg, package managers, or network tools are installed."
@@ -544,7 +544,6 @@ async def main() -> None:
 
     repo = os.environ.get("HARNESS_GITHUB_REPO", "")
     pr_number = int(os.environ.get("HARNESS_GITHUB_PR", "0") or "0")
-    repo_path = _target_repo_path()
     tool_capabilities = [
         "github:pr",
         "github:replies",
@@ -577,16 +576,21 @@ async def main() -> None:
         tool_capabilities=tool_capabilities,
         secret_backend="env",
     )
-    await _preflight(settings, repo=repo, pr_number=pr_number, repo_path=repo_path)
+    await _preflight(settings, repo=repo, pr_number=pr_number)
 
     storage = SQLiteStorage(DEMO_DB)
     await storage.migrate()
     registry = build_registry()
     review_workspace = tempfile.TemporaryDirectory(prefix="harness-pr-review-")
+    clone_token = await github_app_installation_token(
+        {"github_app_private_key": os.environ["HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY"]}
+    )
     review_repo_path = await asyncio.to_thread(
-        _prepare_review_checkout,
-        repo_path,
+        _clone_pr_checkout,
+        repo,
+        pr_number,
         Path(review_workspace.name),
+        clone_token,
     )
     schemas = ContainerSchemaRegistry(
         [
@@ -635,7 +639,6 @@ async def main() -> None:
                 "repo": repo,
                 "pr": pr_number,
                 "repo_path": str(review_repo_path),
-                "source_repo_path": str(repo_path),
             }
         )
         await storage.create_session(session)
@@ -690,7 +693,6 @@ async def main() -> None:
                     "session_id": session.id,
                     "repo": repo,
                     "pr_number": pr_number,
-                    "repo_path": str(repo_path),
                     "review_repo_path": str(review_repo_path),
                     "model_provider": settings.model_provider,
                     "embedding_provider": settings.embedding_provider,
@@ -838,7 +840,7 @@ def _review_prompt(
         "failures, missing tests, and release risk.\n\n"
         f"GitHub repo: {repo}\n"
         f"Pull request number: {pr_number}\n"
-        f"Local repository root: {repo_path}\n\n"
+        f"Cloned PR workspace: {repo_path}\n\n"
         "Relevant review preferences may already appear in the context above. Treat "
         "them as standing instructions when they apply to this PR.\n\n"
         "Start by calling github.pr_replies. If it returns user replies, handle those "
@@ -851,12 +853,12 @@ def _review_prompt(
         "review unless a reply explicitly asks for one; otherwise return a concise "
         "final answer summarizing what was processed and any memory written.\n\n"
         "For a fresh review, call github.pr_context to fetch PR metadata, changed "
-        "files, and checks. Then inspect the local checkout with repo.bash. Use as "
+        "files, and checks. Then inspect the cloned PR checkout with repo.bash. Use as "
         "many repo.bash calls as needed to understand the project structure, changed "
         "code, tests, and likely failure modes. Stop exploring when you have enough "
         "evidence for a concrete review.\n\n"
         "repo.bash runs inside Docker with no network and read-only access to the "
-        "local checkout at /repo. "
+        "cloned PR checkout at /repo. "
         "Prefer cheap read-only commands such as find, sed, grep, python one-liners, "
         "and test/config discovery. Do not use git, rg, package "
         "managers, network access, or commands that write to the repository. If a command "
@@ -872,32 +874,49 @@ def _normalize_private_key(value: str) -> str:
     return value.replace("\\n", "\n").strip()
 
 
-def _prepare_review_checkout(source: Path, target: Path) -> Path:
+def _clone_pr_checkout(repo: str, pr_number: int, target: Path, token: str) -> Path:
+    target.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    env.update(
+        {
+            "GIT_TERMINAL_PROMPT": "0",
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: Bearer {token}",
+        }
+    )
+    repo_url = f"https://github.com/{repo}.git"
+    _run_git(["git", "init", str(target)], env=env)
+    _run_git(["git", "-C", str(target), "remote", "add", "origin", repo_url], env=env)
+    _run_git(
+        [
+            "git",
+            "-C",
+            str(target),
+            "fetch",
+            "--depth=1",
+            "origin",
+            f"refs/pull/{pr_number}/head",
+        ],
+        env=env,
+    )
+    _run_git(["git", "-C", str(target), "checkout", "--detach", "FETCH_HEAD"], env=env)
+    shutil.rmtree(target / ".git", ignore_errors=True)
+    return target
+
+
+def _run_git(command: list[str], *, env: dict[str, str]) -> None:
     result = subprocess.run(
-        ["git", "-C", str(source), "ls-files", "-z"],
+        command,
         check=False,
         capture_output=True,
-        timeout=30,
+        text=True,
+        timeout=120,
+        env=env,
     )
     if result.returncode != 0:
-        raise RuntimeError(
-            "HARNESS_REPO_PATH must be a git checkout so the example can mount a "
-            "tracked-file-only review workspace."
-        )
-    target.mkdir(parents=True, exist_ok=True)
-    for raw_path in result.stdout.split(b"\0"):
-        if not raw_path:
-            continue
-        relative = Path(os.fsdecode(raw_path))
-        if relative.is_absolute() or ".." in relative.parts:
-            continue
-        source_file = source / relative
-        if not source_file.is_file() or source_file.is_symlink():
-            continue
-        target_file = target / relative
-        target_file.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source_file, target_file)
-    return target
+        stderr = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(f"Git command failed: {stderr}")
 
 
 async def _preflight(
@@ -905,7 +924,6 @@ async def _preflight(
     *,
     repo: str,
     pr_number: int,
-    repo_path: Path,
 ) -> None:
     if (
         settings.model_provider == "openai" or settings.embedding_provider == "openai"
@@ -921,8 +939,6 @@ async def _preflight(
         raise RuntimeError("Set HARNESS_GITHUB_REPO, for example owner/repository.")
     if pr_number <= 0:
         raise RuntimeError("Set HARNESS_GITHUB_PR to a real pull request number.")
-    if not repo_path.is_dir():
-        raise RuntimeError(f"HARNESS_REPO_PATH must point to a git checkout: {repo_path}")
     if not os.environ.get("HARNESS_GITHUB_APP_ID"):
         raise RuntimeError("Set HARNESS_GITHUB_APP_ID to the GitHub App id.")
     if not os.environ.get("HARNESS_GITHUB_INSTALLATION_ID"):
@@ -934,11 +950,6 @@ async def _preflight(
         raise RuntimeError(
             "Docker is required for the sandboxed tool. Start Docker and rerun this example."
         )
-
-
-def _target_repo_path() -> Path:
-    raw_path = os.environ.get("HARNESS_REPO_PATH")
-    return Path(raw_path).expanduser().resolve() if raw_path else Path.cwd().resolve()
 
 
 def _load_local_env_file(path: Path) -> None:

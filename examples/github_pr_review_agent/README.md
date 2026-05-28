@@ -12,16 +12,14 @@ main runtime features together:
 - SQLite observability records and dashboard inspection.
 
 Use this example only with repositories and pull requests you trust. The agent
-can inspect the local checkout, run arbitrary read-only shell commands inside a
-Docker container, and publish its review text to the PR through a GitHub App
-comment.
+clones the PR, runs arbitrary read-only shell commands inside a Docker
+container, and publishes its review text to the PR through a GitHub App comment.
 
 Required settings:
 
 ```bash
 export HARNESS_GITHUB_REPO=owner/repository
 export HARNESS_GITHUB_PR=123
-export HARNESS_REPO_PATH=/path/to/local/checkout
 export HARNESS_GITHUB_APP_ID=12345
 export HARNESS_GITHUB_INSTALLATION_ID=67890
 export HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY='-----BEGIN RSA PRIVATE KEY-----...'
@@ -51,12 +49,11 @@ uv sync --extra dev --extra embeddings
 uv run python examples/github_pr_review_agent/agent.py
 ```
 
-`HARNESS_REPO_PATH` must point to a git checkout for the repository being
-reviewed. If it is omitted, the example uses the current working directory. At
-startup, the example copies only git-tracked regular files into a temporary
-review workspace and mounts that workspace read-only at `/repo`, so ignored
-local files, caches, and credentials are not present in the container. The
-container has no network access.
+At startup, the example uses the GitHub App installation token to fetch
+`refs/pull/<number>/head` into a temporary review workspace, removes `.git`, and
+mounts the resulting working tree read-only at `/repo`. Local ignored files,
+caches, and credentials are not present in the container. The container has no
+network access.
 
 The example requires Docker for the sandboxed project-check tool.
 It keeps its SQLite database by default so memories can carry across runs. Set

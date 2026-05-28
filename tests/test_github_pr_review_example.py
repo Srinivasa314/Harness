@@ -91,21 +91,47 @@ def test_github_pr_example_bash_runner_reports_timeout_with_output() -> None:
     assert "timed out" in result["stderr"]
 
 
-def test_github_pr_example_prepares_tracked_file_workspace(tmp_path: Path) -> None:
+def test_github_pr_example_clones_pr_checkout_without_token_in_command(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     module = _load_example_module()
-    repo = _generic_repo(tmp_path)
-    (repo / ".env").write_text("HARNESS_OPENAI_API_KEY=sk-secret\n")
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    subprocess.run(["git", "add", "go.mod", "main.go", "main_test.go"], cwd=repo, check=True)
-
+    commands: list[tuple[list[str], dict[str, str]]] = []
     workspace = tmp_path / "workspace"
-    prepared = module._prepare_review_checkout(repo, workspace)
+
+    def fake_run_git(command: list[str], *, env: dict[str, str]) -> None:
+        commands.append((command, env))
+        if command[:2] == ["git", "init"]:
+            Path(command[2], ".git").mkdir(parents=True)
+        if command[-2:] == ["--detach", "FETCH_HEAD"]:
+            (workspace / "go.mod").write_text("module example.com/service\n")
+
+    monkeypatch.setattr(module, "_run_git", fake_run_git)
+
+    prepared = module._clone_pr_checkout("owner/repo", 7, workspace, "installation-token")
 
     assert prepared == workspace
     assert (workspace / "go.mod").read_text() == "module example.com/service\n"
-    assert (workspace / "main.go").exists()
-    assert not (workspace / ".env").exists()
-    assert not (workspace / "node_modules" / "ignored.js").exists()
+    assert not (workspace / ".git").exists()
+    assert [command for command, _ in commands] == [
+        ["git", "init", str(workspace)],
+        ["git", "-C", str(workspace), "remote", "add", "origin", "https://github.com/owner/repo.git"],
+        [
+            "git",
+            "-C",
+            str(workspace),
+            "fetch",
+            "--depth=1",
+            "origin",
+            "refs/pull/7/head",
+        ],
+        ["git", "-C", str(workspace), "checkout", "--detach", "FETCH_HEAD"],
+    ]
+    assert all("installation-token" not in " ".join(command) for command, _ in commands)
+    assert all(
+        env["GIT_CONFIG_VALUE_0"] == "AUTHORIZATION: Bearer installation-token"
+        for _, env in commands
+    )
 
 
 def test_github_pr_example_registers_comment_tool() -> None:
