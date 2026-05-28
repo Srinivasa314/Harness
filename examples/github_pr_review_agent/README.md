@@ -27,9 +27,9 @@ export HARNESS_GITHUB_INSTALLATION_ID=67890
 export HARNESS_SECRET_GITHUB_APP_PRIVATE_KEY='-----BEGIN RSA PRIVATE KEY-----...'
 ```
 
-The GitHub App must be installed on the target repository and needs pull-request
-read access, contents read access, checks read access, and issues write access
-to post review comments. The example mints an installation token from the App
+The GitHub App must be installed on the target repository and needs contents
+read access, checks read access, issues write access, and pull-request write
+access to post review comments. The example mints an installation token from the App
 private key for every GitHub tool call. Personal access tokens are not supported
 by this example, so PR comments are clearly authored by the installed App.
 If the private key is stored on one line, encode newlines as `\n`; the example
