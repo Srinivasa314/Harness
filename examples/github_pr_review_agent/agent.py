@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import subprocess
+import tempfile
 import time
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import Any, NamedTuple
 
 import aiosqlite
 import anyio
@@ -31,6 +34,7 @@ from harness.schemas import (
 )
 from harness.storage import SQLiteStorage
 from harness.tools import CapabilityGrant, CapabilityPolicy, EnvSecretResolver, ToolRegistry
+from harness.tools.redaction import redact_with_detected_secrets
 
 ROOT = Path(__file__).resolve().parents[2]
 DEMO_DB = ROOT / "data" / "github_pr_review_agent.sqlite3"
@@ -344,19 +348,12 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
     }
     comments: list[dict[str, Any]] = []
     async with httpx.AsyncClient(timeout=60) as client:
-        pr_response = await client.get(
-            f"{GITHUB_API}/repos/{repo}/pulls/{pr_number}",
-            headers=headers,
-        )
-        pr_response.raise_for_status()
-        pr = pr_response.json()
         comments = await _get_paginated_list(
             client,
             f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
             headers=headers,
             list_key=None,
         )
-    pr_author = _github_login(pr.get("user"))
     last_agent_index = -1
     for index, comment in enumerate(comments):
         body = comment.get("body")
@@ -373,7 +370,7 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
             continue
         if not isinstance(comment_id, int):
             continue
-        if not _is_trusted_reply_author(comment, pr_author=pr_author):
+        if not _is_trusted_reply_author(comment):
             continue
         replies.append(
             PullRequestReply(
@@ -385,17 +382,7 @@ async def fetch_pr_user_replies(*, repo: str, pr_number: int, token: str) -> lis
     return replies
 
 
-def _github_login(user: object) -> str | None:
-    if not isinstance(user, dict):
-        return None
-    login = cast(dict[str, Any], user).get("login")
-    return login if isinstance(login, str) and login else None
-
-
-def _is_trusted_reply_author(comment: dict[str, Any], *, pr_author: str | None) -> bool:
-    author = _github_login(comment.get("user"))
-    if author is not None and pr_author is not None and author == pr_author:
-        return True
+def _is_trusted_reply_author(comment: dict[str, Any]) -> bool:
     association = comment.get("author_association")
     return association in TRUSTED_REPLY_ASSOCIATIONS
 
@@ -653,12 +640,18 @@ async def main() -> None:
     storage = SQLiteStorage(DEMO_DB)
     await storage.migrate()
     registry = build_registry()
+    review_workspace = tempfile.TemporaryDirectory(prefix="harness-pr-review-")
+    review_repo_path = await asyncio.to_thread(
+        _prepare_review_checkout,
+        repo_path,
+        Path(review_workspace.name),
+    )
     schemas = ContainerSchemaRegistry(
         [
             ContainerSchema(
                 name="python-analysis",
                 image="python:3.12-alpine",
-                mount=repo_path,
+                mount=review_repo_path,
                 workdir="/repo",
                 network=False,
                 read_only_root=True,
@@ -679,7 +672,7 @@ async def main() -> None:
             ExecutionMode.CONTAINER: DockerContainerExecutor(
                 docker_bin=settings.docker_bin,
                 schemas=schemas,
-                allowed_mount_root=repo_path,
+                allowed_mount_root=review_repo_path,
             ),
         },
         own_storage=True,
@@ -699,7 +692,8 @@ async def main() -> None:
                 "example": "github_pr_review_agent",
                 "repo": repo,
                 "pr": pr_number,
-                "repo_path": str(repo_path),
+                "repo_path": str(review_repo_path),
+                "source_repo_path": str(repo_path),
             }
         )
         await storage.create_session(session)
@@ -724,7 +718,7 @@ async def main() -> None:
             _review_prompt(
                 repo=repo,
                 pr_number=pr_number,
-                repo_path=repo_path,
+                repo_path=review_repo_path,
             ),
         )
         replies = _replies_from_tool_results(result.tool_results)
@@ -750,6 +744,7 @@ async def main() -> None:
                     "repo": repo,
                     "pr_number": pr_number,
                     "repo_path": str(repo_path),
+                    "review_repo_path": str(review_repo_path),
                     "model_provider": settings.model_provider,
                     "embedding_provider": settings.embedding_provider,
                     "final": result.final,
@@ -774,6 +769,7 @@ async def main() -> None:
         )
     finally:
         await runtime.close()
+        review_workspace.cleanup()
 
 
 async def post_pr_comment(*, repo: str, pr_number: int, token: str, review: str) -> str:
@@ -782,7 +778,7 @@ async def post_pr_comment(*, repo: str, pr_number: int, token: str, review: str)
         "Authorization": f"Bearer {token}",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    body = _comment_body(review)
+    body = _comment_body(str(redact_with_detected_secrets(review)))
     async with httpx.AsyncClient(timeout=60) as client:
         response = await client.post(
             f"{GITHUB_API}/repos/{repo}/issues/{pr_number}/comments",
@@ -920,6 +916,34 @@ def _normalize_private_key(value: str) -> str:
     return value.replace("\\n", "\n").strip()
 
 
+def _prepare_review_checkout(source: Path, target: Path) -> Path:
+    result = subprocess.run(
+        ["git", "-C", str(source), "ls-files", "-z"],
+        check=False,
+        capture_output=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            "HARNESS_REPO_PATH must be a git checkout so the example can mount a "
+            "tracked-file-only review workspace."
+        )
+    target.mkdir(parents=True, exist_ok=True)
+    for raw_path in result.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = Path(os.fsdecode(raw_path))
+        if relative.is_absolute() or ".." in relative.parts:
+            continue
+        source_file = source / relative
+        if not source_file.is_file() or source_file.is_symlink():
+            continue
+        target_file = target / relative
+        target_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target_file)
+    return target
+
+
 async def _preflight(
     settings: HarnessSettings,
     *,
@@ -942,7 +966,7 @@ async def _preflight(
     if pr_number <= 0:
         raise RuntimeError("Set HARNESS_GITHUB_PR to a real pull request number.")
     if not repo_path.is_dir():
-        raise RuntimeError(f"HARNESS_REPO_PATH must point to a local checkout: {repo_path}")
+        raise RuntimeError(f"HARNESS_REPO_PATH must point to a git checkout: {repo_path}")
     if not os.environ.get("HARNESS_GITHUB_APP_ID"):
         raise RuntimeError("Set HARNESS_GITHUB_APP_ID to the GitHub App id.")
     if not os.environ.get("HARNESS_GITHUB_INSTALLATION_ID"):

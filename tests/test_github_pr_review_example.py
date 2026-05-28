@@ -61,6 +61,23 @@ def test_github_pr_example_bash_runner_reports_nonzero_exit(tmp_path: Path) -> N
     assert "missing-file" in result["stderr"]
 
 
+def test_github_pr_example_prepares_tracked_file_workspace(tmp_path: Path) -> None:
+    module = _load_example_module()
+    repo = _generic_repo(tmp_path)
+    (repo / ".env").write_text("HARNESS_OPENAI_API_KEY=sk-secret\n")
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "add", "go.mod", "main.go", "main_test.go"], cwd=repo, check=True)
+
+    workspace = tmp_path / "workspace"
+    prepared = module._prepare_review_checkout(repo, workspace)
+
+    assert prepared == workspace
+    assert (workspace / "go.mod").read_text() == "module example.com/service\n"
+    assert (workspace / "main.go").exists()
+    assert not (workspace / ".env").exists()
+    assert not (workspace / "node_modules" / "ignored.js").exists()
+
+
 def test_github_pr_example_registers_comment_tool() -> None:
     module = _load_example_module()
 

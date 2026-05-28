@@ -117,6 +117,7 @@ class SQLiteStorage(StorageBackend):
                   embedding_dimensions integer,
                   metadata text not null,
                   scope text not null,
+                  importance real not null default 1.0,
                   confidence real not null,
                   source_session_id text,
                   source_turn_id text,
@@ -465,10 +466,10 @@ class SQLiteStorage(StorageBackend):
                 insert into memories (
                   id, namespace, text, embedding, embedding_provider, embedding_model,
                   embedding_dimensions, metadata, scope,
-                  confidence, source_session_id, source_turn_id, updated_at, last_used_at,
-                  expires_at, created_at
+                  importance, confidence, source_session_id, source_turn_id, updated_at,
+                  last_used_at, expires_at, created_at
                 )
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory.id,
@@ -480,6 +481,7 @@ class SQLiteStorage(StorageBackend):
                     memory.embedding_dimensions,
                     to_json(redact(memory.metadata, memory_secrets)),
                     memory.scope.value,
+                    1.0,
                     memory.confidence,
                     memory.source_session_id,
                     memory.source_turn_id,
